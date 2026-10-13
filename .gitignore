@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Local credentials and runtime records
+.env
+.env.*
+!.env.example
+/data/
+/tmp/
+*.log
+
+# Presentation build cache and duplicate exports
+/.ppt-build/
+/output/
+
+# Local agent settings and operating system files
+/.agents/
+/.codex/
+/.aws/
+.DS_Store
+Thumbs.db
+
+# Test and build output
+/coverage/
+/dist/

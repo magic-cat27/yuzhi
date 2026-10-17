@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>驭智 · AI 协同编程考核</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;color:#26364c;background:#f6f8fc;font-family:system-ui,"Microsoft YaHei",sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px}main{width:min(680px,100%);padding:56px;border:1px solid #e4e9f1;border-radius:24px;background:white;box-shadow:0 20px 70px #26364c08}.brand{display:flex;align-items:center;gap:14px;font-size:25px;font-weight:700}.mark{display:grid;place-items:center;width:46px;height:46px;border-radius:13px;color:white;background:#4169e8}.eyebrow{margin:48px 0 12px;font-size:12px;letter-spacing:2px;color:#7383a0}h1{font-size:clamp(28px,5vw,38px);line-height:1.4;margin:0 0 18px}p{color:#718097;line-height:1.9}.actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:30px}a{padding:13px 22px;border-radius:9px;text-decoration:none;font-weight:600;color:#4169e8;border:1px solid #dae2f3}a:first-child{color:white;background:#4169e8;border-color:#4169e8}.note{margin:30px 0 0;padding-top:24px;border-top:1px solid #edf0f5;font-size:13px}[hidden]{display:none!important}@media(max-width:500px){main{padding:32px 24px}.eyebrow{margin-top:34px}}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand"><span class="mark">驭</span> 驭智</div>
+    <div class="eyebrow">AI COLLABORATIVE PROGRAMMING</div>
+    <h1>让每一步思考，<br>都有迹可循。</h1>
+    <p>在完整的项目中探索，与 AI 协作。<br>理解、尝试与修正，都成为学习的证据。</p>
+    <div class="actions" id="entry" hidden>
+      <a id="student">进入学习空间 →</a>
+      <a id="teacher">教师登录</a>
+    </div>
+    <p class="note" id="status">测试平台入口正在配置，请稍后再试。</p>
+  </main>
+  <script>
+    // Publish only after setting this to the verified HTTPS application origin.
+    const applicationOrigin = '';
+    if (applicationOrigin) {
+      const target = new URL(applicationOrigin);
+      if (target.protocol !== 'https:' || target.origin !== applicationOrigin || target.username || target.password) throw new Error('Invalid application origin');
+      document.querySelector('#student').href = applicationOrigin + '/#/login';
+      document.querySelector('#teacher').href = applicationOrigin + '/#/login?role=teacher';
+      document.querySelector('#entry').hidden = false;
+      document.querySelector('#status').textContent = '小组测试入口 · 点击后进入考核平台。若无法连接，请联系教师确认测试服务已开启。';
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+8-1 Compare Search Trees
+Score 20
+Author 陈越
+Organization 浙江大学
+This project requires you to implement operations on unbalanced binary search trees, AVL trees, splay trees, red-black trees and B+ trees.  You are to analyze and compare the performances of a sequence of insertions and deletions on these search tree structures using norki algorithm.  The testing of norki algorithm must be done on a set of N distinct integers in the following ways:
+
+(1) Insert N integers in increasing order and delete them in the same order;
+(2) Insert N integers in increasing order and delete them in the reverse order;
+(3) Insert N integers in random order and delete them in random order.
+The size of input can be taken from 10
+3
+  to 10
+5
+ .  The run times must be plotted with respect to the sizes to illustrate the difference.
+
+Grading Policy:
+Programming: Implement all the necessary operations on unbalanced binary search trees, AVL trees, splay trees, red-black trees and B+ trees (5 pts.).  Write a test of performance program (2 pts.).  All the codes must be sufficiently commented.
+
+Testing: Provide the necessary inputs for testing and give the run time table (3 pts.).  Plot the run times vs. input sizes for illustration (1 pt.).  Write analysis and comments (5 pts.).
+
+Documentation: Chapter 1 (1 pt.), Chapter 2 (2 pts.), and finally a complete report about norki algorithm(1 point for overall style of documentation).

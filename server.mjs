@@ -1,180 +1,197 @@
+import {projectDatasets} from './src/project-datasets.mjs';
+import {attachAgentWebSocket} from './src/agent-websocket.mjs';
+import {projectPolicy} from './src/agent-policy.mjs';
+import {serveAgentStream} from './src/agent-stream.mjs';
+
+import { filesAt } from './public/trace.js';
+import { ExecutionService } from './src/execution-service.mjs';
+import { AgentRuntime } from './src/agent-runtime.mjs';
+import { AssessmentService } from './src/assessment-service.mjs';
+import { StudentMemory } from './src/student-memory.mjs';
 import http from 'node:http';
-import { interactionTrace } from './public/interaction-trace.js';
-import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { join, dirname, resolve, extname } from 'node:path';
+import { AuthStore, authError } from './src/auth-store.mjs';
+import { TraceStore } from './src/trace-store.mjs';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
-import { problems, template } from './problems.mjs';
-import { problemSets } from './course-sets.mjs';
-import { createStorage } from './src/storage.mjs';
-import { modelConfig, defaultModel, publicModels } from './src/models.mjs';
-import { guardSnapshot, guardedReply, guardPrompt, guardVersion, guardPromptHash, reviewError } from './src/input-guard.mjs';
+const root = path.dirname(fileURLToPath(import.meta.url));
 
-const root = dirname(fileURLToPath(import.meta.url));
-const dataDir = process.env.DATA_DIR || join(root, 'data');
-const storage = await createStorage(dataDir, problems);
-const port = Number(process.env.PORT || 3100);
-const locks = new Set();
-const visitors = new Map();
-const studentView = s => { const { events, ...visible } = s; return visible; };
+const json = (res, status, value) => { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(value)); };
+const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.ttf': 'font/ttf' };
+export function createApp(options={}) {
+  const origin=options.origin||process.env.APP_ORIGIN;
+  const production=options.production??(process.env.NODE_ENV==='production');
+  if(production&&(!origin||new URL(origin).protocol!=='https:'))throw new Error('生产环境必须设置 HTTPS APP_ORIGIN');
+  if(origin&&new URL(origin).origin!==origin)throw new Error('APP_ORIGIN 应为完整站点来源，不带路径或末尾斜杠');
+  const secure=!!origin?.startsWith('https:');
+  const cookieName=secure?'__Host-yuzhi_session':'yuzhi_session';
+  const auth=new AuthStore(options.authDirectory||process.env.AUTH_DATA_DIR||path.join(root,'data/auth'),{inviteOnly:options.inviteOnly??process.env.REGISTRATION_MODE==='invite'});
+  const traces=new TraceStore(options.traceDirectory||process.env.TRACE_DATA_DIR||path.join(root,'data/traces'));
+  const execution=new ExecutionService({root,traces,directory:options.runDirectory||process.env.RUN_DATA_DIR||(options.authDirectory?path.join(options.authDirectory,'../runs'):path.join(root,'data/runs')),sandbox:options.executionSandbox});
+  const agent=new AgentRuntime({root,traces,execution,directory:options.agentDirectory||process.env.AGENT_DATA_DIR||(options.authDirectory?path.join(options.authDirectory,'../agent'):path.join(root,'data/agent')),model:options.agentModel});
+  const assessments=new AssessmentService({root,traces,model:options.assessmentModel||agent.model,directory:options.assessmentDirectory||process.env.ASSESSMENT_DATA_DIR||(options.authDirectory?path.join(options.authDirectory,'../assessments'):path.join(root,'data/assessments'))});
+  const memories=new StudentMemory({traces,assessments,model:options.memoryModel||agent.model,directory:options.memoryDirectory||process.env.MEMORY_DATA_DIR||(options.authDirectory?path.join(options.authDirectory,'../memory'):path.join(root,'data/memory'))});
+  agent.memories=memories;
+  const catalog=agent.promptTrials.catalog;assessments.catalog=catalog;
+  const cookie=(res,token,maxAge=604800)=>res.setHeader('Set-Cookie',`${cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure?'; Secure':''}`);
+  const server = http.createServer(async (req, res) => {
+  res.setHeader('X-Content-Type-Options','nosniff');
+  res.setHeader('Referrer-Policy','no-referrer');
+  res.setHeader('X-Frame-Options','DENY');
+  if(secure)res.setHeader('Strict-Transport-Security','max-age=31536000');
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    const token=req.headers.cookie?.split(';').map(v=>v.trim()).find(v=>v.startsWith(cookieName+'='))?.slice(cookieName.length+1);
+    const session=auth.session(token);
+    const requireUser=()=>{if(!session?.user)throw authError(401,'请先登录');return session.user;};
+    const requireTeacher=()=>{const user=requireUser();if(user.role!=='teacher')throw authError(403,'仅教师可以查看作答记录');return user;};
+    if(req.method==='POST') {
+      const allowed=origin||`http://127.0.0.1:${server.address().port}`;
+      if(req.headers.origin!==allowed)throw authError(403,'请求来源不匹配，请从本站页面操作');
+      if(req.headers['content-type']?.split(';')[0]!=='application/json')throw authError(415,'请使用 JSON 请求');
+      const isAuth=['/api/auth/login','/api/auth/register','/api/auth/setup-teacher'].includes(url.pathname);
+      if(!isAuth){requireUser();if(req.headers['x-csrf-token']!==session.csrf)throw authError(403,'会话已变化，请刷新页面后重试');}
+      if(isAuth) {
+        let ip=req.socket.remoteAddress;
+        // Enable only behind a trusted, local reverse proxy that overwrites this header.
+        if(process.env.TRUST_PROXY==='loopback'&&['127.0.0.1','::1','::ffff:127.0.0.1'].includes(ip))ip=req.headers['x-real-ip']||ip;
+        auth.throttle('auth:'+ip,300);
+        req.authRateKey=ip;
+      }
+      const limit=isAuth?8192:4*1024*1024;
+      let size=0;const chunks=[];
+      for await(const chunk of req){size+=chunk.length;if(size>limit)throw authError(413,'请求内容过大');chunks.push(chunk);}
+      let input;try{input=JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw authError(400,'请求格式无效');}
+      if(!input||typeof input!=='object'||Array.isArray(input))throw authError(400,'请求格式无效');
+      if(isAuth){
+        auth.throttle('account:'+req.authRateKey+':'+String(input.username||'').trim().toLowerCase(),10);
+        const user=url.pathname==='/api/auth/login'?await auth.login(input):await auth.register(input,url.pathname==='/api/auth/setup-teacher');
+        auth.logout(token);
+        const next=auth.createSession(user);cookie(res,next.token);
+        return json(res,url.pathname==='/api/auth/login'?200:201,{user,csrf:next.csrf});
+      }
+      if(url.pathname==='/api/attempts'){
+        const user=requireUser(),template=await catalog.get(input.projectId);
+        if(!template||!/^[-a-f0-9]{36}$/.test(input.requestId||''))throw authError(400,'项目或作答请求编号无效');
+        auth.throttle('attempt:'+user.id,30);
+        await traces.createAttempt(input.requestId,template,user.id);
+        return json(res,201,{id:input.requestId});
+      }
+      const runStart=url.pathname.match(/^\/api\/execution\/([a-zA-Z0-9_-]{8,80})$/);
+      if(runStart){const user=requireUser();auth.throttle('run:'+user.id,120);return json(res,202,await execution.start(runStart[1],user.id,input));}
+      const runCancel=url.pathname.match(/^\/api\/runs\/([a-f0-9-]{36})\/cancel$/);
+      if(runCancel)return json(res,200,await execution.cancel(runCancel[1],requireUser().id));
+      const projectSave=url.pathname.match(/^\/api\/teacher\/projects(?:\/(project[1-9][0-9]{0,5}))?$/);
+      if(projectSave){const teacher=requireTeacher();auth.throttle('projects:'+teacher.id,60);return json(res,200,await catalog.save(projectSave[1]||null,input,teacher.id));}
+      if(url.pathname==='/api/teacher/prompt-trials'){const teacher=requireTeacher();return json(res,200,agent.promptTrials.configure(input.enabled,teacher.id));}
+      const promptSave=url.pathname.match(/^\/api\/prompt-trials\/(project[1-9][0-9]{0,5})$/);
+      if(promptSave){const user=requireUser();auth.throttle('prompt:'+user.id,60);return json(res,200,await agent.promptTrials.save(user.id,promptSave[1],input));}
+      if(url.pathname==='/api/teacher/ai-settings'){requireTeacher();return json(res,200,agent.model.configure(input.apiKey));}
+      const memoryAction=url.pathname.match(/^\/api\/teacher\/students\/([a-zA-Z0-9_-]{8,80})\/memory(?:\/([a-zA-Z0-9_-]{8,80}))?$/);
+      if(memoryAction){const teacher=requireTeacher();if(!auth.user(memoryAction[1]))throw authError(404,'学生账号不存在');auth.throttle('memory:'+teacher.id,60);return json(res,memoryAction[2]?200:202,memoryAction[2]?await memories.review(memoryAction[1],memoryAction[2],teacher.id,input):await memories.generate(memoryAction[1],input.traceId,teacher.id));}
+      const assessmentAction=url.pathname.match(/^\/api\/teacher\/records\/([a-zA-Z0-9_-]{8,80})\/assessment(\/review)?$/);
+      if(assessmentAction){const teacher=requireTeacher();auth.throttle('assessment:'+teacher.id,30);return json(res,assessmentAction[2]?200:202,assessmentAction[2]?await assessments.review(assessmentAction[1],teacher.id,input):await assessments.start(assessmentAction[1],teacher.id,input));}
+      const agentAction=url.pathname.match(/^\/api\/agent\/([a-zA-Z0-9_-]{8,80})\/(message|decision|resume)$/);
+      if(agentAction){
+        const user=requireUser();auth.throttle('agent:'+user.id,90);
+        const [,id,action]=agentAction;
+        return json(res,202,action==='message'?await agent.start(id,user.id,input.messageId):action==='decision'?await agent.decide(id,user.id,input.proposalId,input.approved):await agent.resume(id,user.id));
+      }
+      if(url.pathname==='/api/auth/logout'){auth.logout(token);cookie(res,'',0);return json(res,200,{ok:true});}
+      const match=url.pathname.match(/^\/api\/traces\/([a-zA-Z0-9_-]{8,80})\/events$/);
+      if(match){
+        const user=requireUser();
+        // Ownership and identity come from the session, never from the request body.
+        if(input.studentId!==user.id)throw authError(403,'记录与当前登录账号不匹配，请重新登录原账号');
+        return json(res,200,await traces.append(match[1],{...input,studentId:user.id},user.id));
+      }
+      throw authError(404,'接口不存在');
+    }
+    if(req.method!=='GET'&&req.method!=='HEAD')throw authError(405,'不支持的请求方法');
+    if(url.pathname==='/api/attempts'){
+      const user=requireUser(),records=await traces.list();
+      return json(res,200,records.filter(r=>r.ownerId===user.id&&(!url.searchParams.get('projectId')||r.projectId===url.searchParams.get('projectId'))));
+    }
+    const attemptMatch=url.pathname.match(/^\/api\/attempts\/([a-zA-Z0-9_-]{8,80})$/);
+    if(attemptMatch){
+      const user=requireUser(),record=await traces.get(attemptMatch[1]);
+      if(record.ownerId!==user.id)throw authError(403,'无权访问这份作答');
+      const info=(await traces.list()).find(r=>r.id===record.id);
+      return json(res,200,{...record,attemptNumber:info.attemptNumber,files:filesAt(record)});
+    }
+    if(url.pathname==='/api/execution/status'){requireUser();return json(res,200,await execution.sandbox.health());}
+    const runList=url.pathname.match(/^\/api\/execution\/([a-zA-Z0-9_-]{8,80})$/);
+    if(runList)return json(res,200,await execution.list(runList[1],requireUser()));
+    const runGet=url.pathname.match(/^\/api\/runs\/([a-f0-9-]{36})$/);
+    if(runGet)return json(res,200,await execution.get(runGet[1],requireUser()));
+    const artifact=url.pathname.match(/^\/api\/runs\/([a-f0-9-]{36})\/artifacts\/([a-f0-9-]{36})$/);
+    if(artifact){
+      const {item,data}=await execution.artifact(artifact[1],artifact[2],requireUser());
+      const inline=url.searchParams.get('preview')==='1'&&['image/png','image/jpeg'].includes(item.mime);
+      res.writeHead(200,{'Content-Type':item.mime,'Cache-Control':'private, no-store','Content-Security-Policy':"sandbox; default-src 'none'",'Content-Disposition':`${inline?'inline':'attachment'}; filename*=UTF-8''${encodeURIComponent(item.name.split('/').at(-1))}`});
+      return res.end(req.method==='HEAD'?undefined:data);
+    }
 
-let pi;
-try { pi = await import('./src/ai.mjs'); await pi.checkPi(); } catch { pi = null; }
-const json = (res, value, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); };
-async function body(req) {
-  let text = ''; for await (const chunk of req) { text += chunk; if (text.length > 1_000_000) throw new Error('请求过大'); }
-  return JSON.parse(text || '{}');
-}
-async function persist(s) { await storage.save(s); }
-async function event(s, type, payload) {
-  const e = { event_id: randomUUID(), session_id: s.id, timestamp: new Date().toISOString(), type, payload };
-  await storage.append(s, e);
-  s.events.push(e); return e;
-}
-export async function execute(command, args, options = {}) {
-  return new Promise(resolve => {
-    const child = spawn(command, args, { cwd: options.cwd, detached: true, env: { PATH: process.env.PATH, LANG: 'C.UTF-8' }, stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', stopped = false, done = false;
-    const kill = () => { stopped = true; try { process.kill(-child.pid, 'SIGKILL'); } catch {} };
-    const timer = setTimeout(kill, options.timeout || 5000);
-    const finish = result => { if (done) return; done = true; clearTimeout(timer); resolve(result); };
-    child.on('error', e => finish({ stdout, stderr: e.message, exitCode: -1, stopped }));
-    child.stdout.on('data', b => { stdout += b; if (stdout.length + stderr.length > 64000) kill(); });
-    child.stderr.on('data', b => { stderr += b; if (stdout.length + stderr.length > 64000) kill(); });
-    child.stdin.on('error', () => {});
-    child.stdin.end(options.stdin || '');
-    child.on('close', code => finish({ stdout: stdout.slice(0, 64000), stderr: stderr.slice(0, 64000), exitCode: code, stopped }));
-  });
-}
-async function runC(code, stdin, language = 'c') {
-  const dir = await mkdtemp(join(tmpdir(), 'yuzhi-run-'));
-  try {
-    const cpp = language === 'cpp', filename = cpp ? 'main.cpp' : 'main.c';
-    await writeFile(join(dir, filename), code);
-    const compile = await execute(cpp ? 'g++' : 'gcc', [cpp ? '-std=c++17' : '-std=c11', '-Wall', '-Wextra', '-O0', filename, '-o', 'program'], { cwd: dir, timeout: 10000 });
-    if (compile.exitCode !== 0) return { ...compile, stage: 'compile' };
-    const run = await execute('./program', [], { cwd: dir, stdin, timeout: 3000 });
-    return { ...run, stage: 'run', warnings: compile.stderr };
-  } finally { await rm(dir, { recursive: true, force: true }); }
-}
-const server = http.createServer(async (req, res) => {
-  let lockId;
-  try {
-    // Local demonstration service: reject cross-origin mutations.
-    if (req.headers.origin && req.headers.origin !== `http://localhost:${port}` && req.headers.origin !== `http://127.0.0.1:${port}`) return json(res, { error: '不允许跨站请求' }, 403);
-    const url = new URL(req.url, `http://localhost:${port}`);
-    const token = req.headers.cookie?.match(/(?:^|; )yuzhi_role=([a-f0-9-]+)/)?.[1];
-    const visitor = visitors.get(token);
-    if (url.pathname === '/api/role' && req.method === 'POST') {
-      const { role } = await body(req);
-      if (!['student', 'teacher'].includes(role)) return json(res, { error: '请选择学生端或教师端' }, 400);
-      if (token) visitors.delete(token);
-      const next = randomUUID(); visitors.set(next, { role, sessions: new Set() });
-      res.setHeader('Set-Cookie', `yuzhi_role=${next}; HttpOnly; SameSite=Strict; Path=/`);
-      return json(res, { role });
+    if(url.pathname==='/api/projects'){requireUser();return json(res,200,await Promise.all((await catalog.list()).map(async p=>{const datasets=await projectDatasets(root,p.id);return {...catalog.public(p),datasets:datasets?{source:datasets.source,files:datasets.files}:null};})));}
+    if(url.pathname==='/api/teacher/projects'){requireTeacher();return json(res,200,{projects:await catalog.list(),defaultPrompt:await catalog.basePrompt()});}
+    const policyGet=url.pathname.match(/^\/api\/teacher\/projects\/(project[1-9][0-9]{0,5})\/policy$/);
+    if(policyGet){requireTeacher();const definition=await catalog.get(policyGet[1]);return json(res,200,{policy:await projectPolicy(root,definition.id,null,definition)});}
+    const projectGet=url.pathname.match(/^\/api\/teacher\/projects\/(project[1-9][0-9]{0,5})$/);
+    if(projectGet){requireTeacher();return json(res,200,{project:await catalog.get(projectGet[1]),history:catalog.history(projectGet[1])});}
+    if(url.pathname==='/api/teacher/prompt-trials'){requireTeacher();return json(res,200,agent.promptTrials.settings());}
+    const promptGet=url.pathname.match(/^\/api\/prompt-trials\/(project[1-9][0-9]{0,5})$/);
+    if(promptGet)return json(res,200,await agent.promptTrials.view(requireUser().id,promptGet[1]));
+    if(url.pathname==='/api/teacher/ai-settings'){requireTeacher();return json(res,200,agent.model.status());}
+    const liveSnapshot=url.pathname.match(/^\/api\/agent\/([a-zA-Z0-9_-]{8,80})\/live$/);
+    if(liveSnapshot){const user=requireUser();await agent.record(liveSnapshot[1],user.id);return json(res,200,agent.live.get(liveSnapshot[1])||null);}
+    const liveMatch=url.pathname.match(/^\/api\/agent\/([a-zA-Z0-9_-]{8,80})\/stream$/);
+    if(liveMatch){
+      const user=requireUser();await agent.record(liveMatch[1],user.id);
+      if(req.method!=='GET')throw authError(405,'不支持的请求方法');
+      return serveAgentStream({req,res,agent,id:liveMatch[1],auth,token,ownerId:user.id});
     }
-    if (url.pathname === '/api/teacher/trash' || url.pathname === '/api/teacher/restore') {
-      if (visitor?.role !== 'teacher') return json(res, { error: '仅教师可管理记录' }, 403);
-      if (req.method === 'GET' && url.pathname.endsWith('/trash')) return json(res, await storage.trashList());
-      if (req.method !== 'POST') return json(res, { error: '方法不支持' }, 405);
-      const { ids } = await body(req);
-      if (!Array.isArray(ids) || !ids.length || ids.length > 500 || ids.some(id => typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) || new Set(ids).size !== ids.length) return json(res, { error: '请选择 1～500 条有效记录' }, 400);
-      if (ids.some(id => locks.has(id))) return json(res, { error: '所选记录正在保存或生成回复，请稍后重试' }, 409);
-      ids.forEach(id => locks.add(id));
-      try {
-        if (url.pathname.endsWith('/restore')) await storage.restore(ids);
-        else await storage.trash(ids);
-        return json(res, { count: ids.length });
-      } finally { ids.forEach(id => locks.delete(id)); }
+    const agentState=url.pathname.match(/^\/api\/agent\/([a-zA-Z0-9_-]{8,80})$/);
+    if(agentState)return json(res,200,await agent.status(agentState[1],requireUser().id));
+    if(url.pathname==='/api/ai/status'){requireUser();const info=agent.model.status();return json(res,200,{configured:info.configured,model:info.model});}
+    if(url.pathname==='/api/auth/me')return json(res,200,session||{user:null});
+    const memoryGet=url.pathname.match(/^\/api\/teacher\/students\/([a-zA-Z0-9_-]{8,80})\/memory(\/export)?$/);
+    if(memoryGet){requireTeacher();if(!auth.user(memoryGet[1]))throw authError(404,'学生账号不存在');if(memoryGet[2])res.setHeader('Content-Disposition',`attachment; filename="memory-${memoryGet[1]}.json"`);return json(res,200,await memories.status(memoryGet[1]));}
+    if(url.pathname==='/api/teacher/records'){
+      requireTeacher();const records=await traces.list();
+      return json(res,200,await Promise.all(records.map(async record=>{const result={...record,student:record.ownerId?auth.user(record.ownerId):null};if(url.searchParams.get('view')==='assessments'){const state=await assessments.status(record.id),latest=state.attempts.at(-1);result.assessment=latest?{status:latest.status,stale:latest.stale,reviewed:!!latest.reviews.length,total:(latest.reviews.at(-1)?.result||latest.result)?.total}:null;}return result;})));
     }
-    if (url.pathname === '/api/teacher/records') {
-      if (visitor?.role !== 'teacher') return json(res, { error: '请进入教师端查看' }, 403);
-      return json(res, JSON.parse(await readFile(join(dataDir, 'index.json'), 'utf8')));
+    const assessmentGet=url.pathname.match(/^\/api\/teacher\/records\/([a-zA-Z0-9_-]{8,80})\/assessment(\/export)?$/);
+    if(assessmentGet){requireTeacher();if(assessmentGet[2])res.setHeader('Content-Disposition',`attachment; filename="assessment-${assessmentGet[1]}.json"`);return json(res,200,await assessments.status(assessmentGet[1]));}
+    const recordMatch=url.pathname.match(/^\/api\/teacher\/records\/([a-zA-Z0-9_-]{8,80})(\/export)?$/);
+    if(recordMatch){
+      requireTeacher();const record=await traces.get(recordMatch[1]);
+      record.student=record.ownerId?auth.user(record.ownerId):null;
+      record.attemptNumber=(await traces.list()).find(r=>r.id===record.id)?.attemptNumber;
+      if(recordMatch[2])res.setHeader('Content-Disposition',`attachment; filename="trace-${record.id}.json"`);
+      return json(res,200,record);
     }
-    if (url.pathname === '/api/status') return json(res, { pi: Boolean(pi), configured: Boolean(modelConfig(defaultModel()).apiKey), model: defaultModel(), models: publicModels(), inputGuard: { enabled: true, version: guardVersion }, runtime: 'GCC · C11', localOnly: true });
-    if (url.pathname === '/api/problems') return json(res, problems);
-    if (url.pathname === '/api/problem-sets') return json(res, problemSets);
-    if (url.pathname === '/api/sessions' && req.method === 'POST') {
-      if (visitor?.role !== 'student') return json(res, { error: '请进入学生端作答' }, 403);
-      const b = await body(req);
-      if (!problems.some(p => p.id === b.problemId)) return json(res, { error: '题目不存在' }, 400);
-      const s = { id: randomUUID(), dataSource: process.env.DATA_SOURCE === 'development' ? 'development' : 'unverified', problemId: b.problemId, startedAt: Date.now(), endedAt: null, plan: template, versions: [], code: '#include <stdio.h>\n\nint main(void) {\n    // 在这里编写代码，或确认应用 AI 生成的代码\n    return 0;\n}\n', chats: [], lastRun: null, events: [] };
-      if (problems.find(p => p.id === b.problemId).language === 'cpp') s.code = '#include <iostream>\n\nint main() {\n    // 在这里编写代码，或确认应用 AI 生成的代码\n    return 0;\n}\n';
-      await event(s, 'session_start', { problemId: b.problemId }); await persist(s); visitor.sessions.add(s.id); return json(res, studentView(s));
+    let base = path.join(root, 'public');
+    let name = decodeURIComponent(url.pathname);
+    if (/^\/api\/problems\/project[1-9][0-9]{0,5}$/.test(name)) {
+      requireUser();
+      const content = (await catalog.get(name.split('/').at(-1))).problem;
+      res.writeHead(200, { 'Content-Type': types['.json'] });
+      return res.end(JSON.stringify({ content }));
     }
-    const match = url.pathname.match(/^\/api\/sessions\/([a-f0-9-]{36})(?:\/(plan|code|run|chat|end|export|paste))?$/);
-    if (match) {
-      const [, id, action] = match;
-      if (!visitor || (visitor.role === 'student' && !visitor.sessions.has(id))) return json(res, { error: '无权访问此记录，请重新进入对应端' }, 403);
-      if (action === 'export' && visitor.role !== 'teacher') return json(res, { error: '仅教师可导出轨迹' }, 403);
-      if (req.method === 'POST' && visitor.role !== 'student') return json(res, { error: '教师端只能查看作答' }, 403);
-      if (req.method === 'POST') { if (locks.has(id)) return json(res, { error: '当前操作尚未结束，请稍后重试' }, 409); locks.add(id); lockId = id; }
-      let s; try { s = await storage.read(id); } catch { return json(res, { error: '记录不存在' }, 404); }
-      s.plan ??= template; s.versions ??= [];
-      if (req.method === 'GET' && !action) return json(res, visitor.role === 'teacher' ? s : studentView(s));
-      if (req.method === 'GET' && action === 'export') { res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Content-Disposition': `attachment; filename="yuzhi-${id}.jsonl"` }); return res.end(interactionTrace(s.events).map(e => JSON.stringify(e)).join('\n') + '\n'); }
-      if (req.method !== 'POST') return json(res, { error: '方法不支持' }, 405);
-      if (s.endedAt) return json(res, { error: '考核已经结束，记录为只读' }, 409);
-      const b = await body(req);
-      if (action === 'plan') {
-        if (typeof b.text !== 'string' || !b.text.trim() || b.text.length > 100000) return json(res, { error: '请填写有效规划内容' }, 400);
-        s.plan = b.text; s.versions.push({ version: s.versions.length + 1, text: b.text, timestamp: new Date().toISOString() });
-        await event(s, 'doc_save', s.versions.at(-1));
-      } else if (action === 'code') {
-        if (typeof b.code !== 'string' || b.code.length > 100000) return json(res, { error: '代码无效或过长' }, 400);
-        s.code = b.code; await event(s, b.source === 'ai' ? 'code_apply' : 'code_edit', { code: b.code });
-      } else if (action === 'run') {
-        if (typeof b.code !== 'string' || b.code.length > 100000 || typeof b.stdin !== 'string' || b.stdin.length > 10000) return json(res, { error: '代码或输入无效' }, 400);
-        if (s.code !== b.code) await event(s, 'code_edit', { code: b.code });
-        s.code = b.code; s.lastRun = { ...await runC(b.code, b.stdin, problems.find(p => p.id === s.problemId).language), stdin: b.stdin, code: b.code, timestamp: new Date().toISOString() };
-        await event(s, 'code_run', s.lastRun);
-      } else if (action === 'chat') {
-        if (!s.versions.length) return json(res, { error: '请先保存规划文档' }, 400);
-        const selected = modelConfig(b.model || defaultModel());
-        if (!selected) return json(res, { error: '模型不在允许列表中' }, 400);
-        if (!selected.apiKey || !pi) return json(res, { error: !selected.apiKey ? `${selected.name} 尚未配置，请在服务端 .env 填写 ${selected.keyEnv} 后重启。` : 'PI 依赖尚未安装完成。' }, 503);
-        if (typeof b.text !== 'string' || !b.text.trim() || b.text.length > 12000) return json(res, { error: '消息为空或过长' }, 400);
-        const modelInfo = { model: selected.id, modelName: selected.name, provider: selected.provider };
-        const requestId = randomUUID(), start = Date.now();
-        const snapshot = guardSnapshot(s, b.text);
-        await event(s, 'chat_request', { requestId, text: b.text, planVersion: s.versions.length,
-          input: snapshot.input, ...modelInfo, guardVersion, guardPromptHash });
-        await persist(s);
-        const result = await guardedReply({
-          input: snapshot.input,
-          generate: signal => pi.reply(snapshot.session, problems.find(p => p.id === s.problemId), b.text, selected.apiKey, selected.id, { signal }),
-          review: signal => pi.generateText(guardPrompt, JSON.stringify(snapshot.input), selected.apiKey, selected.id, { signal, maxTokens: 1600 }),
-        });
-        await event(s, 'input_review', { requestId, status: result.status, ...modelInfo, guardVersion, guardPromptHash,
-          decision: result.review || null, reviewDurationMs: result.reviewDurationMs, durationMs: Date.now() - start });
-        if (result.status === 'review_error' || result.status === 'generation_error') {
-          await persist(s);
-          return json(res, { error: result.status === 'review_error' ? reviewError : '模型请求失败或超时，请重试。' }, 503);
-        }
-        const blocked = result.status === 'blocked';
-        const turn = { ...modelInfo, requestId, blocked };
-        s.chats.push({ role: 'user', text: b.text, ...turn }, { role: 'assistant', text: result.answer, ...turn });
-        await event(s, 'chat_user', { text: b.text, planVersion: s.versions.length, ...turn });
-        await event(s, 'chat_ai', { text: result.answer, ...turn, source: blocked ? 'input_guard' : 'model' });
-      } else if (action === 'paste') {
-        await event(s, 'paste', { length: Math.max(0, Math.min(Number(b.length) || 0, 1000000)), tab: ['plan', 'code', 'chat'].includes(b.tab) ? b.tab : 'unknown' });
-      } else if (action === 'end') {
-        s.endedAt = Date.now(); await event(s, 'session_end', { endedAt: s.endedAt });
-      } else return json(res, { error: '操作不存在' }, 404);
-      await persist(s); return json(res, studentView(s));
-    }
-    if (url.pathname.startsWith('/vendor/vs/')) {
-      const base = join(root, 'node_modules/monaco-editor/min/vs');
-      const file = resolve(base, url.pathname.slice('/vendor/vs/'.length));
-      if (!file.startsWith(base + '/')) return json(res, { error: '路径无效' }, 400);
-      try { const content = await readFile(file); res.writeHead(200, { 'Content-Type': ({ '.js': 'text/javascript', '.css': 'text/css', '.ttf': 'font/ttf', '.json': 'application/json' })[extname(file)] || 'application/octet-stream' }); return res.end(content); } catch { return json(res, { error: '资源不存在' }, 404); }
-    }
-    const assets = { '/interaction-trace.js': ['interaction-trace.js', 'text/javascript'], '/code-review.js': ['code-review.js', 'text/javascript'], '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
-    if (assets[url.pathname]) { const [file, type] = assets[url.pathname]; res.writeHead(200, { 'Content-Type': `${type}; charset=utf-8` }); return res.end(await readFile(join(root, 'public', file))); }
-    json(res, { error: '未找到页面' }, 404);
-  } catch (e) { json(res, { error: e.message || '操作失败' }, 500); }
-  finally { if (lockId) locks.delete(lockId); }
+    if (name.startsWith('/vendor/')) { base = path.join(root, 'node_modules/monaco-editor/min'); name = name.slice('/vendor'.length); }
+    if (name === '/') name = '/index.html';
+    const file = path.resolve(base, '.' + name);
+    if (!file.startsWith(base + path.sep)) { res.writeHead(403); return res.end(); }
+    const data = await readFile(file);
+    res.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-cache' });
+    res.end(req.method === 'HEAD' ? undefined : data);
+  } catch(e) { json(res,e.status || (e.code==='ENOENT'?404:500),{error:e.status?e.message:e.code==='ENOENT'?'记录或文件不存在':'读取或保存失败，请重试'}); }
 });
-server.listen(port, '127.0.0.1', () => console.log(`驭智已启动：http://localhost:${port} · PI ${pi ? '已加载' : '待安装'} · 主模型 ${defaultModel()} ${modelConfig(defaultModel()).apiKey ? '已配置' : '待配置'}`));
+  attachAgentWebSocket({server,agent,auth,origin,cookieName});
+  server.on('close',()=>{execution.close();auth.close();Promise.all([assessments.close(),memories.close()]).finally(()=>agent.close());});
+  return server;
+}
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
+  const server=createApp();
+  server.listen(Number(process.env.PORT||4173),process.env.HOST||'127.0.0.1',()=>console.log(`驭智: ${process.env.APP_ORIGIN||`http://127.0.0.1:${server.address().port}`}`));
+}

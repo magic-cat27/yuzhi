@@ -1,315 +1,442 @@
-import { reviewCode } from './code-review.js';
-import { interactionTrace } from './interaction-trace.js';
-const $ = s => document.querySelector(s);
-const $$ = s => [...document.querySelectorAll(s)];
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-let problems = [], session, current, status, tab = 'plan', view = 'workspace', editor, busy = false, codeDirty = false;
-let sessions = {}, exam = null, entering = false;
-let allProblems = [], activeSet;
-let problemSets = [];
-const languageLabel = language => language === 'cpp' ? 'C++17 / G++' : 'C11 / GCC';
-const codeFilename = () => current?.language === 'cpp' ? 'main.cpp' : 'main.c';
-
-const sessionStates = new Map();
-const drafts = new Map();
-async function api(path, body) { const r = await fetch('/api/' + path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); const data = await r.json(); if (!r.ok) throw new Error(data.error || '请求失败'); return data; }
-function toast(text) { $('#toast').textContent = text; $('#toast').classList.add('visible'); clearTimeout(toast.timer); toast.timer = setTimeout(() => $('#toast').classList.remove('visible'), 5500); }
-function showGuardWarning() { if (!$('#guard-warning').open) $('#guard-warning').showModal(); }
-$('#guard-warning-confirm').onclick = () => $('#guard-warning').close();
-$('#guard-warning').addEventListener('close', () => $('#chat-input').focus());
-function confirmDialog(title, html, label = '确认') { return new Promise(resolve => { $('#dialog-body').innerHTML = `<h2>${esc(title)}</h2>${html}`; $('#dialog-confirm').textContent = label; $('#dialog').showModal(); const finish = yes => { $('#dialog').close(); resolve(yes); }; $('#dialog-confirm').onclick = () => finish(true); $('#dialog-cancel').onclick = () => finish(false); $('#dialog').oncancel = () => resolve(false); }); }
-function setBusy(value) { busy = value; $('#send').textContent = value ? '处理中…' : '发送 ↑'; updateState(); }
-function code() { return editor ? editor.getValue() : $('#code-fallback').value; }
-function putCode(value) { if (editor) editor.setValue(value); else $('#code-fallback').value = value; codeDirty = false; $('#code-save-state').textContent = '已保存'; }
-function storeDraft() { if (!session) return; const d = { plan: $('#plan-editor').value, code: code(), stdin: $('#stdin').value }; drafts.set(session.id, d); localStorage.setItem(`yuzhi-draft-${session.id}`, JSON.stringify(d)); }
-function updateState() {
-  if (!session) return;
-  sessionStates.set(session.problemId, session);
-  const ended = Boolean(session.endedAt), unlocked = session.versions.length > 0;
-  const dirty = $('#plan-editor').value !== session.plan;
-  $('#save-state').textContent = dirty || !unlocked ? '未保存' : '已保存'; $('#save-state').classList.toggle('dirty', dirty || !unlocked);
-  $('#plan-count').textContent = `${$('#plan-editor').value.length} 字`;
-  $('#version-label').textContent = unlocked ? `已保存 ${session.versions.length} 个版本 · 当前 v${session.versions.length}` : '尚未生成版本';
-  $('#chat-lock').textContent = unlocked ? '' : '⌑';
-  $('#chat-context').textContent = unlocked ? `参考规划 v${session.versions.length} · ${dirty ? '有未保存修改，AI 仍使用已保存版本' : '规划与代码由你掌握'}` : '先独立完成并保存规划文档，再开启 AI 协作。';
-  $('#chat-input').disabled = !unlocked || ended || busy;
-  $('#send').disabled = !unlocked || ended || busy;
-  $('#save-plan').disabled = ended || busy; $('#save-code').disabled = ended || busy; $('#run').disabled = ended || busy; $('#end').disabled = ended || busy;
-  $('#plan-editor').readOnly = ended || busy; $('#code-fallback').readOnly = ended || busy; editor?.updateOptions({ readOnly: ended || busy });
-  $('#session-status').textContent = ended ? '已提交 · 只读' : unlocked ? '考核进行中' : '规划阶段';
-  $('#footer-status').textContent = `规划 ${session.versions.length} 版 · 对话 ${session.chats.length / 2} 轮`;
-  const selected = status.models.find(m => m.id === $('#model-select').value);
-  $('#model-select').disabled = ended || busy;
-  $('#send').disabled ||= !selected?.configured;
-  $('#model-status').textContent = !status.pi ? 'PI 依赖待安装' : selected?.configured ? `${selected.route} · 密钥已配置` : `${selected?.route || '模型'} · 未配置密钥`;
-  $('#model-status').classList.toggle('status-green', status.pi && selected?.configured);
-}
-async function selectProblem(id, fresh = false) {
-  if (busy) return toast('请等待当前操作结束');
-  if (!exam) return;
-  storeDraft(); current = problems.find(p => p.id === id); if (!current) return;
-  session = null;
-  if (sessions[id] && !fresh) { try { session = await api(`sessions/${sessions[id]}`); } catch {} }
-  if (!session) { session = await api('sessions', { problemId: id }); sessions[id] = session.id;  }
-  let draft = drafts.get(session.id); if (!draft) { try { draft = JSON.parse(localStorage.getItem(`yuzhi-draft-${session.id}`)); } catch {} }
-  $('#plan-editor').value = !session.endedAt && draft ? (draft.plan ?? session.plan) : session.plan;
-  $('.language-badge').textContent = languageLabel(current.language);
-  $('#code-filename').textContent = codeFilename();
-  $('#code-language').textContent = `${languageLabel(current.language)} · UTF-8`;
-  $('#code-fallback').setAttribute('aria-label', `${current.language === 'cpp' ? 'C++' : 'C'} 代码编辑器`);
-  if (editor) { monaco.editor.setModelLanguage(editor.getModel(), current.language === 'cpp' ? 'cpp' : 'c'); editor.updateOptions({ ariaLabel: `${current.language === 'cpp' ? 'C++' : 'C'} 代码编辑器` }); }
-  putCode(!session.endedAt && draft ? draft.code : session.code);
-  codeDirty = code() !== session.code;
-  $('#stdin').value = draft?.stdin ?? current.sampleInput;
-  $('#problem-heading').textContent = `${current.number} / ${current.title}`;
-  $('#problem-list').innerHTML = problems.map(p => `<button class="problem-item ${p.id === id ? 'active' : ''}" data-problem="${p.id}"><span class="problem-num">${p.number}</span><span><strong>${esc(p.title.split(' · ')[0])}</strong><small>${esc(p.title.split(' · ')[1])}</small></span></button>`).join('');
-  $$('[data-problem]').forEach(b => b.onclick = () => selectProblem(b.dataset.problem).catch(e => toast(e.message)));
-  $('#problem-content').innerHTML = `<span class="eyebrow">${esc(current.course)} / PROGRAMMING</span><h2>${esc(current.title)}</h2><div class="tags"><span class="tag level">${esc(current.difficulty)}</span>${current.tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div><p>${esc(current.description)}</p><h3>输入格式</h3><p>${esc(current.input)}</p><h3>输出格式</h3><p>${esc(current.output)}</p><h3>样例输入</h3><div class="sample-box"><div class="sample-label">STDIN</div><pre>${esc(current.sampleInput)}</pre></div><h3>样例输出</h3><div class="sample-box"><div class="sample-label">STDOUT</div><pre>${esc(current.sampleOutput)}</pre></div><div class="problem-note">先完成规划，再开启 AI 协作。请独立考虑题目中的输入约束与边界情况。</div>`;
-  const source = current.source || activeSet.source;
-  if (source) $('#problem-content').insertAdjacentHTML('beforeend', `<div class="problem-source">选题参考：<a href="${esc(source.url)}" target="_blank" rel="noopener noreferrer">${esc(source.title)}</a><p>本平台自编的单文件练习，参考公开资料主题，非原课程完整实验。</p></div>`);
-  showRun(); renderMessages(); setView('workspace'); setTab('plan'); updateState();
-}
-function setTab(name) { tab = name; $$('.tab').forEach(t => { const selected = t.dataset.tab === name; t.classList.toggle('active', selected); t.setAttribute('aria-selected', String(selected)); }); ['plan', 'chat', 'code'].forEach(n => $(`#${n}-pane`).classList.toggle('hidden', n !== name)); if (name === 'code') editor?.layout(); }
-function renderMessages() {
-  if (!session.chats.length) {
-    $('#messages').innerHTML = `<div class="chat-welcome"><div class="welcome-symbol">✦</div><h3>你来规划，AI 来实现</h3><p>保存你的规划后，告诉 AI 需要完成什么。<br>遇到不明确的设计，AI 会请你补充。<br>生成的代码由你确认后写入。</p><div class="steps">独立规划 → 保存文档 → 开始协作</div></div>`; return;
-  }
-  $('#messages').innerHTML = session.chats.map((m, i) => {
-    let chunks = m.text.split(/```(?:c|C|cpp|c\+\+)?\s*\n([\s\S]*?)```/g);
-    return `<div class="message ${m.role}"><div class="who">${m.role === 'user' ? '你' : m.blocked ? '平台提示' : '✦ AI · ' + esc(m.modelName || m.model || 'DeepSeek（历史记录）')}</div><div class="bubble">${chunks.map((c, j) => j % 2 ? `<pre>${esc(c)}</pre>${m.role === 'assistant' ? `<button class="small primary apply-code" data-message="${i}" data-block="${j}">查看修改并应用 ${codeFilename()}</button>` : ''}` : esc(c)).join('')}</div></div>`;
-  }).join('');
-  $$('.apply-code').forEach(b => { b.disabled = Boolean(session?.endedAt) || busy; b.onclick = async () => {
-    const value = session.chats[Number(b.dataset.message)].text.split(/```(?:c|C|cpp|c\+\+)?\s*\n([\s\S]*?)```/g)[Number(b.dataset.block)].trim() + '\n';
-    const original = code(), sessionId = session.id;
-    const approved = await reviewCode({ original, proposed: value, filename: codeFilename(), language: current.language === 'cpp' ? 'cpp' : 'c' });
-    if (!approved) return;
-    if (session?.id !== sessionId || session.endedAt || busy || code() !== original) return toast('当前代码或作答状态已变化，请重新查看差异');
-    setBusy(true);
-    try { session = await api(`sessions/${sessionId}/code`, { code: value, source: 'ai' }); putCode(value); storeDraft(); setTab('code'); updateState(); toast('已应用审核后的修改，可以编译运行'); } catch (e) { toast(e.message); }
-    finally { setBusy(false); }
-  }; });
-  $('#messages').scrollTop = $('#messages').scrollHeight;
-}
-function showRun() { const r = session.lastRun; if (!r) { $('#run-state').textContent = '尚未运行'; $('#output').textContent = '点击「编译运行」查看真实输出。'; return; } const label = r.stopped ? '超时 / 输出超限' : r.stage === 'compile' ? '编译失败' : r.exitCode === 0 ? '运行完成' : `退出状态 ${r.exitCode}`; $('#run-state').textContent = label; $('#run-state').className = r.exitCode === 0 ? 'status-green' : 'status-red'; $('#output').textContent = [r.stdout, r.stderr, r.warnings].filter(Boolean).join('\n') || '程序正常结束，无输出。'; }
-async function saveCode() { if (code() === session.code) return; session = await api(`sessions/${session.id}/code`, { code: code(), source: 'manual' }); codeDirty = false; $('#code-save-state').textContent = '已保存'; updateState(); storeDraft(); }
-$('#save-plan').onclick = async () => { try { session = await api(`sessions/${session.id}/plan`, { text: $('#plan-editor').value }); storeDraft(); updateState(); toast(`规划 v${session.versions.length} 已保存，AI 对话已解锁`); } catch (e) { toast(e.message); } };
-$('#plan-editor').oninput = () => { storeDraft(); updateState(); };
-$('#save-code').onclick = () => saveCode().then(() => toast('代码已保存')).catch(e => toast(e.message));
-function changedCode() { codeDirty = true; $('#code-save-state').textContent = '未保存'; storeDraft(); }
-$('#code-fallback').oninput = changedCode; $('#stdin').oninput = storeDraft;
-$('#sample-input').onclick = () => { $('#stdin').value = current.sampleInput; storeDraft(); };
-$('#run').onclick = async () => { setBusy(true); $('#run-state').textContent = '编译运行中…'; try { session = await api(`sessions/${session.id}/run`, { code: code(), stdin: $('#stdin').value }); codeDirty = false; $('#code-save-state').textContent = '已保存'; showRun(); storeDraft(); } catch (e) { toast(e.message); $('#run-state').textContent = '运行失败'; } finally { setBusy(false); } };
-$('#send').onclick = async () => { const text = $('#chat-input').value.trim(); if (!text || busy) return; setBusy(true); try { await saveCode(); session = await api(`sessions/${session.id}/chat`, { text, model: $('#model-select').value }); $('#chat-input').value = ''; renderMessages(); const last = session.chats.at(-1); if (last?.role === 'assistant' && last.blocked === true) showGuardWarning(); } catch (e) { toast(e.message); } finally { setBusy(false); renderMessages(); } };
-$('#chat-input').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('#send').click(); };
-$('#end').onclick = async () => { if (busy) return; if (!await confirmDialog('结束本次考核？', '<p>当前代码会保存，考核结束后将变为只读。未保存的规划草稿不会作为正式版本提交，请先确认规划已经保存。</p>', '确认结束')) return; try { setBusy(true); await saveCode(); for (const [problemId, id] of Object.entries(sessions)) { const state = sessionStates.get(problemId); const ended = state?.endedAt ? state : await api(`sessions/${id}/end`, {}); sessionStates.set(problemId, ended); if (id === session.id) session = ended; } exam.endedAt = Date.now(); updateState(); renderMessages(); setView('overview'); toast('题集已提交，完整轨迹已保留'); } catch (e) { toast(e.message); } finally { setBusy(false); } };
-$('#work-help').onclick = () => confirmDialog('如何完成一次考核', '<p>1. 阅读题目，独立编写并保存规划。<br>2. 在 AI 对话中发出实现请求。<br>3. 如果 AI 反问，请在规划文档中补全并保存。<br>4. 检查生成的代码，确认写入当前代码文件。<br>5. 编译运行，检查结果，必要时继续排查。<br>6. 结束并提交考核。</p><p>当前为本机演示版，过程评分后续接入。</p>', '知道了');
-$$('.tab').forEach(b => b.onclick = () => setTab(b.dataset.tab));
-$$('.nav-item').forEach(b => b.onclick = () => setView(b.dataset.view));
-const names = { chat_blocked: '已拦截', chat_failed: '回复未完成', session_start: '开始考核', doc_save: '保存规划', chat_user: '学生发出指令', chat_ai: 'AI 回复', code_apply: '确认应用 AI 代码', code_edit: '保存手动代码', code_run: '编译运行', session_end: '结束考核', paste: '粘贴操作' };
-function setView(name) {
-  if (!exam || !['overview', 'workspace'].includes(name)) return;
-  view = name;
-  $('.sidebar').classList.toggle('hidden', name === 'overview');
-  $('.workspace-heading').classList.toggle('hidden', name === 'overview');
-  if (name === 'overview') { renderOverview(); } $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === name)); $('#workspace').classList.toggle('hidden', name !== 'workspace'); $('#alternate-view').classList.toggle('hidden', name === 'workspace');
-  if (name === 'overview') return;
-  if (name === 'workspace') { if (tab === 'code') editor?.layout(); return; }
-}
-
-for (const [selector, name] of [['#plan-editor', 'plan'], ['#code-fallback', 'code'], ['#chat-input', 'chat']]) $(selector).addEventListener('paste', e => { if (!session || session.endedAt || busy) return; api(`sessions/${session.id}/paste`, { length: e.clipboardData.getData('text').length, tab: name }).catch(() => {}); });
-function updateTimer() { const seconds = exam ? Math.max(0, Math.floor(((exam.endedAt || Date.now()) - exam.startedAt) / 1000)) : 0; const value = [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map(n => String(n).padStart(2, '0')).join(':'); $('#timer').textContent = '◷ ' + value; if ($('#overview-time')) $('#overview-time').textContent = value; }
-setInterval(updateTimer, 1000);
-window.addEventListener('beforeunload', storeDraft);
-function showSets() {
-  document.body.classList.add('at-home'); $('#sets-page').classList.remove('hidden'); $('.layout').classList.add('hidden'); $('#back-to-sets').classList.add('hidden');
-  $('.course').innerHTML = '考核练习<span>规划由你掌握，实现与 AI 协作</span>';
-  $('#footer-status').textContent = '选择题集后开始计时';
-  exam = null; updateTimer();
-  $('.sets-tabs small').textContent = `全部题集 · ${problemSets.length}`;
-  $('#set-list').innerHTML = problemSets.map(set => { const count = allProblems.filter(p => set.problemIds.includes(p.id)).length; return `<button class="set-card" data-set="${set.id}" ${!count ? 'disabled' : ''}><span class="set-icon">▣</span><span class="set-info"><strong>${esc(set.title)}</strong><small>${count} 道编程题 · ${languageLabel(set.language)} · ${esc(set.category)}</small></span><span class="set-right"><span class="pill">${count ? '可参加' : '请重启服务加载题目'}</span><small>进入考核 →</small></span></button>`; }).join('');
-  $$('[data-set]').forEach(b => b.onclick = () => enterSet(b.dataset.set));
-}
-async function leaveExam() {
-  if (busy || entering) return toast('请等待当前操作结束');
-  if (exam && !exam.endedAt && !await confirmDialog('返回题集列表？', '<p>本次记录会保留。再次进入题集将开启新的考核，规划、代码和对话重新开始。</p>', '返回列表')) return;
-  storeDraft(); showSets();
-}
-async function enterSet(setId) {
-  if (entering) return;
-  activeSet = problemSets.find(s => s.id === setId);
-  if (!activeSet) return;
-  problems = allProblems.filter(p => activeSet.problemIds.includes(p.id));
-  if (!problems.length) return;
-  entering = true; $$('[data-set]').forEach(b => b.disabled = true);
-  try {
-    storeDraft(); session = null; sessions = {}; sessionStates.clear();
-    exam = { startedAt: Date.now(), endedAt: null };
-    for (const p of problems) { const state = await api('sessions', { problemId: p.id }); sessions[p.id] = state.id; sessionStates.set(p.id, state); }
-    document.body.classList.remove('at-home'); $('#sets-page').classList.add('hidden'); $('.layout').classList.remove('hidden'); $('#back-to-sets').classList.remove('hidden');
-    $('.course').innerHTML = `${esc(activeSet.title)}<span>AI 协同编程考核</span>`;
-    $('.sidebar-sub').textContent = `${activeSet.course} · ${activeSet.language === 'cpp' ? '单文件 C++' : '单文件 C'}`;
-    $('#problem-count').textContent = String(problems.length).padStart(2, '0');
-    await selectProblem(problems[0].id); updateTimer(); setView('overview');
-  } catch (e) { showSets(); toast(e.message); }
-  finally { entering = false; $$('[data-set]').forEach(b => b.disabled = !allProblems.some(p => problemSets.find(s => s.id === b.dataset.set).problemIds.includes(p.id))); }
-}
-function renderOverview() {
-  const states = [...sessionStates.values()];
-  const planned = states.filter(s => s.versions.length).length;
-  const tested = states.filter(s => s.lastRun).length;
-  const ended = Boolean(exam.endedAt);
-  $('#alternate-view').innerHTML = `<div class="overview-grid"><div class="overview-hero">▣<span>${esc(activeSet.title)}</span></div><section class="overview-card"><div class="overview-title"><h2>本次考核</h2><span class="pill">${ended ? '已提交' : '答题中'}</span></div><p>开始时间 <strong>${new Date(exam.startedAt).toLocaleString('zh-CN')}</strong></p><p>考核用时 <strong id="overview-time">00:00:00</strong></p><div class="overview-actions"><button id="continue-exam" class="primary">${ended ? '查看作答' : '开始答题'} →</button><button id="overview-end" class="end-button" ${ended ? 'disabled' : ''}>结束考核</button></div></section><section class="overview-card"><h2>题集信息</h2><p>题目类型 <strong>编程题</strong></p><p>编程语言 <strong>${languageLabel(activeSet.language)}</strong></p><p>题目数量 <strong>${problems.length} 道</strong></p></section><section class="overview-card progress-card"><h2>作答进度</h2><div class="overview-stats"><span>已保存规划 <strong>${planned} / ${problems.length}</strong></span><span>已尝试运行 <strong>${tested} / ${problems.length}</strong></span><span>考核状态 <strong>${ended ? '已结束' : '进行中'}</strong></span></div><table><thead><tr><th>编程题</th><th>规划版本</th><th>运行状态</th><th>操作</th></tr></thead><tbody>${problems.map(p => { const s = sessionStates.get(p.id); return `<tr><td>${esc(p.title)}</td><td>${s.versions.length ? 'v' + s.versions.length : '未保存'}</td><td>${s.lastRun ? (s.lastRun.exitCode === 0 ? '运行完成' : '需检查') : '未运行'}</td><td><button class="text-button" data-overview-problem="${p.id}">${ended ? '查看' : '答题'} →</button></td></tr>`; }).join('')}</tbody></table></section><section class="overview-card"><h2>考核流程</h2><ol class="overview-flow"><li>独立规划<span>保存规划，解锁 AI</span></li><li>协同实现<span>检查并确认写入代码</span></li><li>运行验证<span>测试结果，排查问题</span></li><li>结束考核<span>保存本次过程记录</span></li></ol><button id="overview-back" class="text-button">返回题集列表 →</button></section></div>`;
-  $('#continue-exam').onclick = () => setView('workspace');
-  $('#overview-end').onclick = () => $('#end').click();
-  $('#overview-back').onclick = leaveExam;
-  $$('[data-overview-problem]').forEach(b => b.onclick = () => selectProblem(b.dataset.overviewProblem).catch(e => toast(e.message)));
-  updateTimer();
-}
-$('#back-to-sets').onclick = leaveExam;
-$('.brand').onclick = e => { e.preventDefault(); switchRole(); };
-async function init() {
-  [allProblems, status, problemSets] = await Promise.all([api('problems'), api('status'), api('problem-sets')]);
-  $('#model-select').innerHTML = status.models.map(m => `<option value="${esc(m.id)}">${esc(m.name)}${m.recommended ? ' · 推荐' : ''}${m.configured ? '' : ' · 未配置'}</option>`).join('');
-  $('#model-select').value = status.model;
-  $('#model-select').onchange = updateState;
-  showRoles();
-  if (window.require) { window.require.config({ paths: { vs: '/vendor/vs' } }); window.require(['vs/editor/editor.main'], () => {
-    const value = $('#code-fallback').value;
-    editor = monaco.editor.create($('#monaco-editor'), { value, language: current?.language === 'cpp' ? 'cpp' : 'c', theme: 'vs', editContext: false, ariaLabel: current?.language === 'cpp' ? 'C++ 代码编辑器' : 'C 代码编辑器', fontSize: 12, fontFamily: 'Consolas, monospace', minimap: { enabled: false }, scrollBeyondLastLine: false, automaticLayout: true, padding: { top: 16 }, lineNumbersMinChars: 3, overviewRulerLanes: 0, readOnly: Boolean(session?.endedAt) });
-    $('#code-fallback').classList.add('hidden'); editor.onDidChangeModelContent(changedCode); editor.onDidPaste(e => { if (session && !session.endedAt && !busy) api(`sessions/${session.id}/paste`, { length: editor.getModel().getValueInRange(e.range).length, tab: 'code' }).catch(() => {}); });
-  }, () => { $('#monaco-editor').classList.add('hidden'); }); } else $('#monaco-editor').classList.add('hidden');
-}
-init().catch(e => toast(`初始化失败：${e.message}`));
-
-let teacherRecords = [], teacherTab = 'records';
-function showRoles() {
-  document.body.classList.add('at-home');
-  ['#sets-page', '#teacher-page', '.layout', '#back-to-sets', '#switch-role', '#teacher-models'].forEach(s => $(s).classList.add('hidden'));
-  $('#role-page').classList.remove('hidden');
-  $('.course').innerHTML = 'AI 协同编程考核<span>规划由学生掌握，实现与 AI 协作</span>';
-  $('.avatar').textContent = '驭智'; $('#footer-status').textContent = '请选择进入学生端或教师端';
-}
-async function switchRole() {
-  if (busy || entering) return toast('请等待当前操作结束');
-  if (exam && !exam.endedAt && !await confirmDialog('离开本次作答？', '<p>已保存的记录会保留。再次进入学生端会开启新的考核，请先保存规划和代码。</p>', '切换入口')) return;
-  storeDraft(); session = null; exam = null; sessions = {}; sessionStates.clear(); showRoles();
-}
-$('#switch-role').onclick = switchRole;
-$('#teacher-models').onclick = async () => {
-  try {
-    status = await api('status');
-    if ($('#teacher-page').classList.contains('hidden')) return;
-    await confirmDialog('模型配置', `<span class="eyebrow">MODEL PROVIDERS</span><p class="teacher-muted">主模型：${esc(status.model)}。密钥已配置不代表模型已开通或连接已验证；具体可用性以服务商授权和实际调用为准。</p><div class="teacher-courses">${status.models.map(m => `<section class="teacher-course"><div class="teacher-title"><strong>${esc(m.name)}${m.recommended ? ' · 推荐主模型' : ''}</strong><span class="pill">${m.configured ? '密钥已配置' : '未配置'}</span></div><p>${esc(m.brand)} · ${esc(m.purpose)}</p><p class="teacher-muted">接入渠道：${esc(m.route)} · 模型 ID：${esc(m.id)}</p></section>`).join('')}</div><p class="teacher-muted">百炼模型在服务端配置 DASHSCOPE_API_KEY，DeepSeek 配置 DEEPSEEK_API_KEY。第三方模型可能需要在百炼控制台单独开通。修改配置后重启服务。</p>`, '关闭');
-  } catch (e) { toast(e.message); }
+import {connectAgentLive} from './agent-live.js';
+import {showPromptTrial} from './prompt-workbench.js';
+import {welcomeTitle,welcomeBody} from './agent-welcome.js';
+import { mountExecution } from './execution.js';
+import { agentRequest, renderAgentStatus, reviewChanges } from './agent-client.js';
+import { currentSession, setSession, authRequest, renderAuth, renderAccountHeader } from './auth.js';
+let projects=[];
+import { migrateWorkspace, restoreAttempt } from './workspace-state.js';
+import { createTrace, addEvent, syncTrace, textChange } from './trace.js';
+import { renderTeacher } from './teacher.js';
+const $ = (s, root = document) => root.querySelector(s);
+const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const paths = {
+ grid:'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z',
+ arrow:'M5 12h14m-5-5 5 5-5 5', back:'M19 12H5m5-5-5 5 5 5', chevron:'m9 5 7 7-7 7',
+ tree:'M12 3v6m-7 6v-4h14v4M3 16h4v5H3z M10 3h4v5h-4z M17 16h4v5h-4z',
+ route:'M5 5h9a5 5 0 0 1 0 10H9m-4-7V2m-3 3h6m8 14h6m-3-3v6 M4 15h6v6H4z',
+ nodes:'M12 7v4M5 16v-5h14v5 M10 2h4v5h-4z M3 16h4v5H3z M17 16h4v5h-4z',
+ book:'M12 6C8 3 4 4 2 5v15c3-2 7-2 10 0 3-2 7-2 10 0V5c-2-1-6-2-10 1v14',
+ clock:'M12 8v5l3 2 M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0',
+ code:'m8 6-6 6 6 6m8-12 6 6-6 6m-3-15-2 18',
+ chat:'M21 11a8 8 0 0 1-8 8H6l-4 3V6a4 4 0 0 1 4-4h7a8 8 0 0 1 8 9z M7 8h9M7 12h6',
+ spark:'m12 2 3 7 7 3-7 3-3 7-3-7-7-3 7-3z',
+ folder:'M3 5h6l2 2h10v13H3z', file:'M5 2h9l5 5v15H5z M14 2v6h5',
+ plus:'M12 5v14M5 12h14', close:'m6 6 12 12M6 18 18 6', play:'m7 3 14 9-14 9z',
+ check:'m5 12 4 4L19 6', download:'M12 3v12m-5-5 5 5 5-5 M4 16v5h16v-5',
+ panel:'M3 3h18v18H3z M15 3v18', terminal:'m4 5 6 6-6 6m9 0h7',
+ send:'M12 20V4m-7 7 7-7 7 7', search:'M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16m6-2 6 6',
+ info:'M12 11v6m0-11v1 M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0',
+ collapse:'m9 5 7 7-7 7 M3 3v18', expand:'m15 5-7 7 7 7 M21 3v18',
+ layers:'m12 2 10 5-10 5L2 7z M2 12l10 5 10-5M2 17l10 5 10-5',
+ save:'M4 3h14l3 3v15H3V3z M7 3v6h10V3 M7 21v-8h10v8',
 };
-$$('[data-role]').forEach(b => b.onclick = async () => {
-  $$('[data-role]').forEach(x => x.disabled = true);
+const icon = (name, cls='') => `<svg class="icon ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${paths[name] || paths.file}"/></svg>`;
+let project, state, editor, activeFile, currentKey, modelListener, saveTimer, toastTimer;
+let models = new Map(), openFiles = [], views = new Map();
+let pendingSource = 0, editTimer, syncTimer, agentTimer;
+let agentInfo=null, aiApplying=false, agentStream=null, liveReply=null;
+const pendingSync=new Map();
+const storageKey = (id, owner=currentSession()?.user.id, attemptId=null) => `yuzhi-account:v1:${owner}:${id}${attemptId?':attempt:'+attemptId:''}`;
+function readState(p,attemptId=null) {
+  const initial = { schemaVersion:2, files:{...p.files}, messages:[], startedAt:null, elapsed:0, activeFile:'src/main.c', openFiles:['src/main.c'], chatCollapsed:false, terminalCollapsed:false, treeCollapsed:false };
   try {
-    await api('role', { role: b.dataset.role });
-    $('#role-page').classList.add('hidden'); $('#switch-role').classList.remove('hidden');
-    $('.avatar').textContent = b.dataset.role === 'student' ? '学生' : '教师';
-    if (b.dataset.role === 'student') showSets();
-    else {
-      $('#teacher-page').classList.remove('hidden');
-      $('#teacher-models').classList.remove('hidden');
-      $('.course').innerHTML = '教师工作台<span>查看作答证据，理解学生的思考过程</span>';
-      $('#footer-status').textContent = '作答记录 · 完整轨迹 · 课程题集';
-      await renderTeacher('records');
+    const saved = migrateWorkspace(JSON.parse(localStorage.getItem(storageKey(p.id,undefined,attemptId))), p);
+    if (saved && saved.files && typeof saved.files === 'object' && !Array.isArray(saved.files)) {
+      initial.files = Object.fromEntries(Object.entries(saved.files).filter(([k,v])=>validPath(k) && typeof v==='string'));
+      if (!Object.keys(initial.files).length) initial.files={...p.files};
+      initial.messages = Array.isArray(saved.messages) ? saved.messages.filter(m=>['user','assistant'].includes(m.role) && typeof m.text==='string') : [];
+      for (const key of ['activeFile','openFiles','startedAt','elapsed','chatCollapsed','terminalCollapsed','treeCollapsed','trace','attemptNumber','runSettings']) if(saved[key] !== undefined) initial[key]=saved[key];
     }
-  } catch (e) { showRoles(); toast(e.message); }
-  finally { $$('[data-role]').forEach(x => x.disabled = false); }
+  } catch { /* A damaged or unavailable browser store leaves source templates intact. */ }
+  if(initial.trace) initial.trace.syncing=false;
+  return initial;
+}
+function persist() {
+  if(!project || !state) return;
+  state.activeFile=activeFile; state.openFiles=openFiles;
+  try { localStorage.setItem(storageKey(project.id,state.trace?.studentId,state.trace?.id),JSON.stringify(state));localStorage.setItem(storageKey(project.id,state.trace?.studentId),JSON.stringify(state)); if($('#save-state')) $('#save-state').textContent='已保存到本机'; }
+  catch { if($('#save-state')) $('#save-state').textContent='保存失败，请导出项目'; toast('本地保存不可用，请导出项目以保留修改。'); }
+}
+function toast(message) { $('#toast').textContent=message; $('#toast').classList.add('visible'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('#toast').classList.remove('visible'),3200); }
+let executionCleanup=null;
+function cleanup(){agentStream?.close();agentStream=null;liveReply=null;executionCleanup?.();executionCleanup=null; clearTimeout(agentTimer);agentInfo=null; flushEdit(); if(state?.trace)recordEvent('workspace_left',{},'student',false); clearTimeout(editTimer); clearTimeout(saveTimer); if(state){persist();syncCurrent();} modelListener?.dispose(); editor?.dispose(); editor=null; for(const m of models.values())m.dispose(); models.clear(); views.clear(); }
+const monacoReady = new Promise(resolve=>{
+  if(!window.require) return resolve(null);
+  window.require.config({paths:{vs:'/vendor/vs'}});
+  window.require(['vs/editor/editor.main'],()=>resolve(window.monaco),()=>resolve(null));
 });
-$$('[data-teacher-tab]').forEach(b => b.onclick = () => renderTeacher(b.dataset.teacherTab).catch(e => toast(e.message)));
-async function renderTeacher(name) {
-  teacherTab = name;
-  $$('[data-teacher-tab]').forEach(b => b.classList.toggle('active', b.dataset.teacherTab === name));
-  const host = $('#teacher-content');
-  if (name === 'assessment') {
-    host.innerHTML = '<span class="eyebrow">PROCESS ASSESSMENT</span><h1>过程评价</h1><div class="teacher-empty"><h2>先看见过程，再评价能力</h2><p>过程性评分尚未接入。当前可以查看完整作答证据，供教师人工审阅。</p><button id="teacher-see-records" class="primary">查看作答记录 →</button></div>';
-    $('#teacher-see-records').onclick = () => renderTeacher('records').catch(e => toast(e.message)); return;
+function renderHome(){
+  cleanup(); project=null; state=null;
+  document.body.className='home';
+  $('#app').innerHTML=`<div class="home-layout"><aside class="home-nav"><div class="nav-caption">学习空间</div><button class="nav-active">${icon('grid')}我的项目<span>${projects.length}</span></button><div class="nav-bottom"><div class="mini-brand">${icon('spark')} 让思考有价值</div><p>记录每一步探索，<br>让学习的过程被看见。</p><span class="environment"><i></i>账号已登录 · 轨迹自动同步</span></div></aside><main class="home-main"><div class="home-breadcrumb">学习空间 ${icon('chevron')} <span>我的项目</span></div><div class="home-content"><div class="page-intro"><div><span class="eyebrow">LEARN. BUILD. UNDERSTAND.</span><h1>我的考核项目<span class="title-dot">.</span></h1><p>从理解问题开始，在实践中构建你的答案。</p></div><span class="semester">${icon('book')} 数据结构与算法 · 项目实践</span></div><div class="overview-banner"><div class="banner-symbol">${icon('layers')}</div><div><h2>你的思路，是项目的起点。</h2><p>独立规划，与 AI 协作实现，在完整的项目工作区中验证想法。</p></div><div class="workflow"><span><b>01</b> 理解问题</span><i></i><span><b>02</b> 协作实现</span><i></i><span><b>03</b> 测试验证</span></div></div><div class="project-toolbar"><div class="filter-tabs"><button class="selected" data-filter="all">全部项目 <span>${projects.length}</span></button><button data-filter="started">进行中 <span>${projects.filter(p=>readState(p).startedAt).length}</span></button></div><label class="search-field">${icon('search')}<input id="project-search" placeholder="搜索项目…" aria-label="搜索项目"></label></div><div id="project-grid" class="project-grid"></div><div class="home-note">${icon('info')} 每个项目可多次作答，每次的文件、对话与轨迹独立保存。</div><div class="learning-note"><div><span class="eyebrow">YOUR THINKING MATTERS</span><h3>不止完成代码，更要理解为什么。</h3></div><p>用你的语言定义问题，用充分的验证检验结果。<br>AI 是你的协作伙伴，思考的方向始终由你掌握。</p></div></div><footer class="home-footer"><span>驭智 · 让每一次思考都有迹可循</span><span>规划 → 实现 → 验证</span></footer></main></div>`;
+  let filter='all';
+  const renderCards=()=>{
+    const query=$('#project-search').value.trim().toLowerCase();
+    const filtered=projects.filter(p=>(filter==='all'||readState(p).startedAt)&&`${esc(p.name)} ${esc(p.english)}`.toLowerCase().includes(query));
+    $('#project-grid').innerHTML=filtered.map(p=>{ const started=readState(p).startedAt; return `<a class="project-card" href="#/project/${p.id}"><div class="card-top"><span class="project-symbol ${p.color}">${icon(p.icon)}</span><span class="project-status ${started?'ongoing':''}"><i></i>${started?'进行中':'未开始'}</span></div><span class="project-number">PROJECT ${p.number}</span><h2>${esc(p.name)}</h2><div class="english-name">${esc(p.english)}</div><p class="card-description">${esc(p.description)}</p><div class="tags">${p.tags.map(t=>`<span>${esc(t)}</span>`).join('')}</div><div class="card-meta"><span>${icon('folder')} C 项目</span><span>${icon('book')} 20 分</span></div><div class="card-action"><span>${started?'选择作答 / 新建':'进入项目'}</span>${icon('arrow')}</div></a>`; }).join('') || '<div class="empty-results">没有符合条件的项目</div>';
+  };
+  renderCards(); $('#project-search').addEventListener('input',renderCards);
+  $$('[data-filter]').forEach(btn=>btn.onclick=()=>{filter=btn.dataset.filter;$$('[data-filter]').forEach(b=>b.classList.toggle('selected',b===btn));renderCards();});
+}
+function problemBody(tab='description'){
+  if(tab==='rubric') return `<div class="problem-title"><span class="eyebrow">ASSESSMENT CRITERIA</span><h2>评分标准</h2><p>项目总分 20 分</p></div>${project.scores.map(([label,score])=>`<div class="rubric-row"><span>${esc(label)}</span><b>${score}<small> 分</small></b></div>`).join('')}<div class="callout">提交内容应包括源代码、测试记录和完整报告。具体评分要求以原始题面为准。</div>`;
+  if(tab==='source') return '<pre id="source-text" class="source-text">正在加载原始题面…</pre>';
+  if(project.customProblem)return `<div class="problem-title"><span class="eyebrow">PROJECT ${project.number}</span><h2>${esc(project.name)}</h2><p>C11 · 项目实践</p></div><pre class="source-text">${esc(project.problem)}</pre>`;
+  return `<div class="problem-title"><span class="eyebrow">PROJECT ${project.number}</span><h2>${esc(project.name)}</h2><p>${esc(project.english)}</p><div class="tags"><span class="level">${esc(project.level)}</span><span>C11</span><span>20 分</span></div></div><h3>项目描述</h3><p>${esc(project.description)}</p><h3>${project.id==='project3'?'红黑树的性质':'任务要求'}</h3><ol class="objectives">${project.objectives.map(t=>`<li>${esc(t)}</li>`).join('')}</ol>${project.id==='project3'?`<p>内部节点指非 NULL 节点。黑高为从根节点到任一 NULL 叶子路径上的黑色节点数，不包含根节点，包含 NULL 叶子。</p><h3>输入与输出</h3><p>输入正整数 <code>N ≤ 500</code>。输出不同红黑树的数量，对 <code>1,000,000,007</code> 取模。</p><div class="sample"><div><span>样例输入</span><code>5</code></div><div><span>样例输出</span><code>8</code></div></div>`:''}${project.extra?`<div class="callout">${esc(project.extra)}</div>`:''}<h3>交付内容</h3><div class="deliverable">${icon('code')} 完整源代码与必要注释</div><div class="deliverable">${icon('check')} 测试用例与结果分析</div><div class="deliverable">${icon('file')} 设计说明与实验报告</div><div class="thinking-note">${icon('spark')}<div><strong>先想一想，再动手。</strong><p>可以直接编写代码，<br>也可以随时与 AI 讨论思路。</p></div></div>`;
+}
+async function renderAttemptPicker(p){
+  cleanup();project=null;state=null;
+  const target=location.hash;
+  document.body.className='home';
+  $('#app').innerHTML='<div class="attempt-page"><p>正在加载作答记录…</p></div>';
+  let unsynced=null;
+  try{
+    const local=readState(p);
+    if(local.trace){
+      if(local.trace.pendingEdit){const edit=local.trace.pendingEdit;delete local.trace.pendingEdit;const event=addEvent(local.trace,'code_edited',edit);event.timestamp=edit.endedAt;}
+      localStorage.setItem(storageKey(p.id,local.trace.studentId,local.trace.id),JSON.stringify(local));
+      await syncCurrent(local,p);
+      if(local.trace.events.some(e=>!local.trace.acknowledged.includes(e.id)))unsynced=local.trace.id;
+    }
+    const records=await agentRequest('/api/attempts?projectId='+p.id);
+    if(location.hash!==target)return;
+    $('#app').innerHTML=`<main class="attempt-page"><a href="#/student">← 全部项目</a><span class="eyebrow">PROJECT ${p.number}</span><h1>${esc(p.name)}</h1><p>选择一次作答继续，或从初始模板新建。旧作答不会被清空。</p><button class="primary" id="new-attempt">新建一次作答</button><p id="attempt-error" role="alert"></p><div class="attempt-list">${records.map(r=>`<a class="attempt-row" href="#/project/${p.id}?attempt=${r.id}"><strong>第 ${r.attemptNumber} 次作答</strong><span>开始于 ${new Date(r.createdAt).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}</span><small>${r.messages} 次提问 · ${r.edits} 段编辑 · ${r.eventCount} 条轨迹</small><b>继续作答 →</b></a>`).join('')||'<p>还没有作答记录。点击上方按钮开始。</p>'}</div></main>`;
+    const requestId=crypto.randomUUID();
+    if(unsynced){const notice=$('#attempt-error');notice.textContent='有一份本机作答尚未同步。请先打开它，导出保存并处理同步问题；新建作答不会清除它。';const link=document.createElement('a');link.href=`#/project/${p.id}?attempt=${unsynced}`;link.textContent='打开待同步作答 →';notice.append(' ',link);}
+    $('#new-attempt').onclick=async()=>{
+      const button=$('#new-attempt');button.disabled=true;
+      try{const next=await agentRequest('/api/attempts',{projectId:p.id,requestId});if(location.hash===target)location.hash=`#/project/${p.id}?attempt=${next.id}`;}
+      catch(e){if(location.hash===target){$('#attempt-error').textContent=e.message;button.disabled=false;}}
+    };
+  }catch(e){if(location.hash===target)$('#app').innerHTML=`<main class="attempt-page"><h2>暂时无法加载作答</h2><p>${esc(e.message)}</p><button id="attempt-retry">重试</button><a href="#/student">返回项目</a></main>`;$('#attempt-retry')?.addEventListener('click',()=>renderAttemptPicker(p));}
+}
+async function renderWorkspace(p,attemptId){
+  cleanup();project=null;state=null;
+  const target=location.hash;
+  $('#app').innerHTML='<div class="attempt-page">正在恢复本次作答…</div>';
+  let loaded;
+  try{
+    const local=readState(p,attemptId);
+    if(local.trace){
+      if(local.trace.pendingEdit){const edit=local.trace.pendingEdit;delete local.trace.pendingEdit;const e=addEvent(local.trace,'code_edited',edit);e.timestamp=edit.endedAt;}
+      await syncCurrent(local,p);
+    }
+    const record=await agentRequest('/api/attempts/'+attemptId);
+    if(record.projectId!==p.id)throw Error('这份作答不属于当前项目');
+    const pending=local.trace?.events.some(e=>!local.trace.acknowledged.includes(e.id));
+    loaded=pending?{...local,attemptNumber:record.attemptNumber}:{...local,...restoreAttempt(record),activeFile:local.activeFile,openFiles:local.openFiles};
+  }catch(e){if(location.hash===target)$('#app').innerHTML=`<main class="attempt-page"><h2>作答恢复失败</h2><p>${esc(e.message)}</p><a href="#/project/${p.id}">返回作答列表</a></main>`;return;}
+  if(location.hash!==target)return;
+  project=p;state=loaded;state.elapsed=Number(state.elapsed)||0;
+  activeFile=Object.hasOwn(state.files,state.activeFile)?state.activeFile:Object.keys(state.files)[0];
+  openFiles=Array.isArray(state.openFiles)?state.openFiles.filter(f=>Object.hasOwn(state.files,f)):[];
+  if(!openFiles.includes(activeFile))openFiles.push(activeFile);
+  initTrace();state.startedAt ||= Date.now();
+  document.body.className='in-workspace';
+  $('#app').innerHTML=`<div class="workspace-top"><a class="back-link" href="#/student">${icon('back')}<span>全部项目</span></a><span class="top-divider"></span><span class="workspace-project-number">PROJECT ${p.number}</span><strong>${esc(p.name)} · 第 ${state.attemptNumber||1} 次</strong><span class="workspace-status"><i></i>进行中</span><div class="workspace-actions"><a class="attempt-switch" href="#/project/${p.id}">作答记录 / 新建</a><span class="timer">${icon('clock')}<span id="timer">00:00:00</span></span><button id="export-project">${icon('download')}<span>导出项目</span></button><button id="toggle-chat" aria-expanded="true">${icon('chat')}<span>AI 助手</span></button></div></div><main class="assessment" id="assessment"><section class="problem-panel"><div class="panel-heading">${icon('book')}<strong>考核题目</strong><span class="quiet-label">独立理解 · 自主规划</span></div><div class="problem-tabs" role="tablist" aria-label="题目信息"><button class="active" data-problem-tab="description" role="tab" aria-selected="true">题目描述</button><button data-problem-tab="rubric" role="tab" aria-selected="false">评分标准</button><button data-problem-tab="source" role="tab" aria-selected="false">原始题面</button></div><article id="problem-content">${problemBody()}</article></section><section class="project-panel"><div class="panel-heading">${icon('code')}<strong>项目工作区</strong><span class="quiet-label" id="save-state">已保存到本机</span><button class="icon-button" id="save-project" aria-label="保存项目" title="保存项目（Ctrl / ⌘ + S）">${icon('save')}</button></div><div class="ide"><aside class="explorer"><div class="explorer-heading"><span>资源管理器</span><button id="new-file" class="icon-button" aria-label="新建文件" title="新建文件">${icon('plus')}</button><button id="hide-tree" class="icon-button" aria-label="折叠文件树" title="折叠文件树">${icon('collapse')}</button></div><div class="project-root">${icon('chevron','rotated')}<span>${esc(p.folder)}</span></div><div id="file-tree" role="navigation" aria-label="项目文件"></div><div class="explorer-footer">${icon('folder')}<span id="file-count"></span> 个文件</div></aside><div class="editor-column"><div class="editor-tabs"><button id="show-tree" class="icon-button" aria-label="展开文件树" title="展开文件树">${icon('panel')}</button><div id="file-tabs" role="tablist" aria-label="打开的文件"></div><button id="toggle-terminal" class="icon-button" aria-label="切换终端面板" title="终端面板">${icon('terminal')}</button></div><div class="editor-breadcrumb"><span>${esc(p.folder)}</span>${icon('chevron')}<span id="file-breadcrumb"></span></div><div id="editor" aria-label="项目代码编辑器"><div class="editor-loading">正在加载代码编辑器…</div></div><div class="editor-status"><span id="language-label">C</span><span>UTF-8</span><span id="cursor-position">行 1，列 1</span><span>空格: 4</span></div><section class="terminal-panel"><div class="terminal-tabs"><button class="active" data-console-tab="terminal">终端</button><button data-console-tab="checks">运行与验证</button><span class="terminal-spacer"></span><button id="run-project" class="run-button">${icon('play')} 运行项目</button><button id="hide-terminal" class="icon-button" aria-label="折叠终端">${icon('close')}</button></div><div id="console-output" class="console-output" role="log" aria-live="polite"><div class="terminal-muted">项目工作区已就绪 · ${esc(p.folder)}</div><div class="terminal-muted">正在检查隔离执行环境。</div><div>输入 <span class="terminal-blue">help</span> 查看运行说明。</div></div><form id="terminal-form"><label for="terminal-input">❯</label><input id="terminal-input" autocomplete="off" spellcheck="false" aria-label="终端命令" placeholder="输入 gcc、python3 等命令…"><span>隔离终端</span></form></section></div></div></section><aside class="chat-panel"><div class="panel-heading"><span class="ai-logo">${icon('spark')}</span><strong>AI 协作助手</strong><button id="collapse-chat" class="icon-button" aria-label="折叠 AI 聊天栏" title="折叠 AI 聊天栏">${icon('collapse')}</button></div><div class="chat-model"><span><i></i>AI Tutor</span><span class="model-badge">正在连接</span></div><div id="agent-controls"></div><div class="chat-context">${icon('folder')}<span>当前项目 · ${esc(p.name)}</span></div><div id="messages" class="messages" aria-live="polite"></div><div class="chat-composer"><div class="context-chip">${icon('file')}<span id="chat-file-context"></span></div><form id="chat-form"><textarea id="chat-input" aria-label="给 AI 助手发送消息" placeholder="说说你的思路，或遇到的问题…" rows="3"></textarea><div class="composer-bottom"><span>Enter 发送 · Shift + Enter 换行</span><button class="primary send-button" aria-label="发送消息" type="submit">${icon('send')}</button></div></form><p class="chat-disclaimer">文件变更经你确认后应用 · 不自动代你规划</p></div></aside><button id="chat-rail" aria-label="展开 AI 聊天栏">${icon('spark')}<span>AI 助手</span>${icon('expand')}</button></main><footer class="workspace-footer"><span><i></i>本地工作区<span class="footer-divider">/</span>每一步思考，都有迹可循</span><span id="trace-status" role="status">轨迹待同步</span></footer>`;
+  state.chatCollapsed=false;renderTree();renderTabs();renderMessages(true);applyPanels();bindWorkspace();persist();updateTimer(); recordEvent('workspace_opened',{file:activeFile});
+  const agentState=state;
+  const key=p.id;currentKey=key;
+  const monaco=await monacoReady;
+  if(currentKey!==key || state!==agentState || !$('#editor'))return;
+  if(monaco){
+    monaco.editor.defineTheme('yuzhi-light',{base:'vs',inherit:true,rules:[{token:'comment',foreground:'96A1B2',fontStyle:'italic'},{token:'keyword',foreground:'8057C5'},{token:'string',foreground:'379374'},{token:'number',foreground:'B98538'}],colors:{'editor.background':'#ffffff','editor.foreground':'#34435C','editorLineNumber.foreground':'#B5BECC','editorLineNumber.activeForeground':'#647C9E','editor.lineHighlightBackground':'#F5F8FD','editor.selectionBackground':'#DDE8FF','editorCursor.foreground':'#3268ED','editorIndentGuide.background1':'#EDF0F5'}});
+    $('#editor').innerHTML='';
+    editor=monaco.editor.create($('#editor'),{theme:'yuzhi-light',automaticLayout:true,editContext:false,fontSize:13,fontFamily:'"Cascadia Code", "DejaVu Sans Mono", Consolas, monospace',lineHeight:23,minimap:{enabled:false},padding:{top:18,bottom:18},scrollBeyondLastLine:false,renderLineHighlight:'all',smoothScrolling:true,tabSize:4,wordWrap:'off',glyphMargin:false,lineNumbersMinChars:3,fixedOverflowWidgets:true,ariaLabel:'项目代码编辑器'});
+    editor.onDidChangeCursorPosition(e=>{if($('#cursor-position'))$('#cursor-position').textContent=`行 ${e.position.lineNumber}，列 ${e.position.column}`;});
+    editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.KeyS,()=>saveProject());
+  } else { $('#editor').innerHTML='<textarea id="fallback-editor" spellcheck="false" aria-label="项目文件编辑器"></textarea>'; $('#fallback-editor').oninput=e=>updateFile(e.target.value); toast('高级编辑器暂不可用，已切换到基础编辑模式。'); }
+  switchFile(activeFile);
+  syncCurrent().then(()=>pollAgent(agentState));
+  connectAgentStream(agentState);
+  executionCleanup=mountExecution({traceId:agentState.trace.id,sync:()=>ensureSynced(agentState),activeFile:()=>activeFile,onUpdate:()=>{if(state===agentState)pollAgent(agentState);},openPanel:()=>{state.terminalCollapsed=false;applyPanels();},settings:()=>agentState.runSettings||{},saveSettings:value=>{agentState.runSettings=value;persist();}});
+}
+function language(path){return path.endsWith('.c')||path.endsWith('.h')?'c':path.endsWith('.py')?'python':path.endsWith('.md')?'markdown':path.endsWith('.json')?'json':'plaintext';}
+function fileIcon(f){return `<span class="file-type ${language(f)}">${language(f)==='c'?'C'+(f.endsWith('.h')?'ʰ':''):language(f)==='python'?'Py':language(f)==='markdown'?'M↓':f.endsWith('.txt')?'≡':'#'}</span>`;}
+function renderTree(){
+  const folders = [...new Set(Object.keys(state.files).filter(f=>f.includes('/')).map(f=>f.split('/')[0]))];
+  const fileButton = (f,indent=false)=>`<button class="file-row ${f===activeFile?'active':''} ${indent?'indented':''}" data-file="${esc(f)}" title="${esc(f)}">${fileIcon(f)}<span>${esc(indent?f.slice(f.indexOf('/')+1):f)}</span></button>`;
+  $('#file-tree').innerHTML=folders.map(folder=>`<details open><summary>${icon('chevron')}${icon('folder')}<span>${esc(folder)}</span></summary>${Object.keys(state.files).filter(f=>f.startsWith(folder+'/')).map(f=>fileButton(f,true)).join('')}</details>`).join('')+Object.keys(state.files).filter(f=>!f.includes('/')).map(f=>fileButton(f)).join('');
+  if(project.datasets){
+    $('#file-tree').insertAdjacentHTML('beforeend',`<details open><summary>${icon('chevron')}${icon('folder')}<span>datasets · 只读</span></summary>${project.datasets.files.map(f=>`<div class="file-row indented" title="${esc(f.path)} · ${(f.bytes/1048576).toFixed(1)} MB">${icon('file')}<span>${esc(f.name)}</span></div>`).join('')}<p style="padding:0 12px;font-size:11px;line-height:1.6">数据已解压。代码和终端可直接读取 datasets/ 下的文件；大文件不在编辑器中打开。</p></details>`);
   }
-  if (name === 'courses') {
-    host.innerHTML = `<span class="eyebrow">COURSE LIBRARY</span><h1>课程题集</h1><p class="teacher-muted">${problemSets.length} 门课程 · ${allProblems.length} 道编程题</p><div class="teacher-courses">${problemSets.map(set => `<details class="teacher-course"><summary><strong>${esc(set.title)}</strong><span>${set.problemIds.length} 道题</span></summary>${allProblems.filter(p => set.problemIds.includes(p.id)).map(p => `<details class="teacher-problem"><summary>${esc(p.title)}</summary><p>${esc(p.description)}</p><h4>输入格式</h4><p>${esc(p.input)}</p><h4>输出格式</h4><p>${esc(p.output)}</p><h4>公开样例</h4><pre>${esc(p.sampleInput)}\n→\n${esc(p.sampleOutput)}</pre></details>`).join('')}</details>`).join('')}</div>`; return;
-  }
-  teacherRecords = await api('teacher/records');
-  if (teacherTab !== 'records' || $('#teacher-page').classList.contains('hidden')) return;
-  host.innerHTML = `<span class="eyebrow">ANSWER RECORDS</span><div class="teacher-title"><h1>作答记录</h1><div class="record-actions"><button id="open-trash" class="quiet-action" aria-expanded="false" aria-controls="inline-trash">回收站</button><button id="teacher-refresh">刷新记录 ↻</button></div></div><p class="teacher-muted">每条记录对应一道题。来源尚未核实，不等同于真实学生人数。</p><section id="inline-trash" class="inline-trash hidden" aria-label="回收站"></section><div class="stat-grid"><div class="stat">题目记录<strong id="record-total">${teacherRecords.length}</strong></div><div class="stat">有 AI 对话<strong id="record-chat-total">${teacherRecords.filter(r => r.messages > 0).length}</strong></div><div class="stat">课程题集<strong>${problemSets.length}</strong></div></div><div class="teacher-filters"><label>课程<select id="record-course"><option value="">全部课程</option>${[...new Set(teacherRecords.map(r => r.course))].map(c => `<option>${esc(c)}</option>`).join('')}</select></label><label>记录类别<select id="record-category"><option value="active">有作答内容</option><option value="">全部记录</option>${['01_有AI对话', '02_有作答无对话', '03_开发验证', '04_仅打开题目'].map(c => `<option value="${c}">${c.slice(3)}</option>`).join('')}</select></label><label>搜索<input id="record-search" placeholder="题目名称或记录编号"></label></div><div id="record-results"></div>`;
-  $('#open-trash').onclick = async () => {
-    const panel = $('#inline-trash'), open = panel.classList.contains('hidden');
-    panel.classList.toggle('hidden', !open);
-    $('#open-trash').setAttribute('aria-expanded', String(open));
-    $('#open-trash').textContent = open ? '收起回收站' : '回收站';
-    if (open) { panel.textContent = '正在加载回收站…'; try { await renderTrash(); } catch (e) { panel.textContent = '加载失败，请收起后重试。'; toast(e.message); } }
-  };
-  $('#teacher-refresh').onclick = () => renderTeacher('records').catch(e => toast(e.message));
-  ['#record-course', '#record-category', '#record-search'].forEach(id => $(id).oninput = renderRecordRows);
-  renderRecordRows();
+  $$('[data-file]').forEach(b=>b.onclick=()=>switchFile(b.dataset.file));
+  $('#file-count').textContent=Object.keys(state.files).length;
 }
-function renderRecordRows() {
-  const course = $('#record-course').value, cat = $('#record-category').value, query = $('#record-search').value.trim().toLowerCase();
-  const rows = teacherRecords.filter(r => (!course || r.course === course) && (!cat || (cat === 'active' ? r.category !== '04_仅打开题目' : r.category === cat)) && `${r.problem} ${r.id}`.toLowerCase().includes(query));
-  $('#record-results').innerHTML = `<div class="teacher-title"><p class="teacher-muted">共 ${rows.length} 条记录 · 时间为北京时间</p><button id="delete-selected" class="danger-button" disabled>删除所选</button></div><div class="teacher-table-wrap"><table class="teacher-table"><thead><tr><th><input type="checkbox" id="select-records" aria-label="全选当前筛选结果" ${rows.length ? '' : 'disabled'}></th><th>题目 / 课程</th><th>开始时间</th><th>类别</th><th>规划 / 消息 / 运行</th><th></th></tr></thead><tbody>${rows.map(r => `<tr><td><input type="checkbox" data-select-record="${r.id}" aria-label="选择 ${esc(r.problem)} ${r.id.slice(0, 8)}"></td><td><strong>${esc(r.problem)}</strong><small>${esc(r.course)} · ${r.id.slice(0, 8)}</small></td><td>${esc(r.startedAt.replace('_', ' ').replace(/(\d{2})-(\d{2})-(\d{2})$/, '$1:$2:$3'))}</td><td><span class="pill">${esc(r.category.slice(3))}</span></td><td>${r.planVersions} / ${r.messages} / ${r.runs}</td><td><button data-record="${r.id}" class="small">查看轨迹 →</button> <button data-delete-record="${r.id}" class="small danger-button">删除</button></td></tr>`).join('')}</tbody></table>${rows.length ? '' : '<div class="teacher-empty">没有符合条件的记录</div>'}</div>`;
-  $$('[data-record]').forEach(b => b.onclick = () => openRecord(b.dataset.record).catch(e => toast(e.message)));
-  const updateSelection = () => {
-    const boxes = $$('[data-select-record]'), count = boxes.filter(b => b.checked).length;
-    $('#delete-selected').disabled = count === 0;
-    $('#delete-selected').textContent = count ? `删除所选（${count}）` : '删除所选';
-    $('#select-records').checked = count > 0 && count === boxes.length;
-    $('#select-records').indeterminate = count > 0 && count < boxes.length;
-  };
-  $('#select-records').onchange = e => { $$('[data-select-record]').forEach(b => b.checked = e.target.checked); updateSelection(); };
-  $$('[data-select-record]').forEach(b => b.onchange = updateSelection);
-  $('#delete-selected').onclick = () => deleteRecords($$('[data-select-record]').filter(b => b.checked).map(b => b.dataset.selectRecord));
-  $$('[data-delete-record]').forEach(b => b.onclick = () => deleteRecords([b.dataset.deleteRecord]));
+function renderTabs(){
+  $('#file-tabs').innerHTML=openFiles.map(f=>`<div class="file-tab ${f===activeFile?'active':''}"><button role="tab" aria-selected="${f===activeFile}" data-open-file="${esc(f)}" title="${esc(f)}">${fileIcon(f)}${esc(f.split('/').at(-1))}</button><button class="tab-close" data-close-file="${esc(f)}" aria-label="关闭 ${esc(f)} 标签页">${icon('close')}</button></div>`).join('');
+  $$('[data-open-file]').forEach(b=>b.onclick=()=>switchFile(b.dataset.openFile));
+  $$('[data-close-file]').forEach(b=>b.onclick=()=>{
+    const f=b.dataset.closeFile; if(openFiles.length===1)return toast('请至少保留一个打开的文件。');
+    openFiles=openFiles.filter(x=>x!==f); if(activeFile===f)switchFile(openFiles.at(-1));else {renderTabs();persist();}
+  });
+  $('#file-breadcrumb').textContent=activeFile;
+  $('#chat-file-context').textContent=activeFile;
+  $('#language-label').textContent=language(activeFile)==='c'?'C':language(activeFile)==='python'?'Python':language(activeFile)==='markdown'?'Markdown':'Plain Text';
 }
-async function openRecord(id) {
-  const s = await api(`sessions/${id}`), p = allProblems.find(p => p.id === s.problemId);
-  const trace = interactionTrace(s.events);
-  if ($('#teacher-page').classList.contains('hidden')) return;
-  $('#teacher-content').innerHTML = `<div class="teacher-title"><button id="records-back">← 返回记录列表</button><a class="primary download-button" href="/api/sessions/${s.id}/export" download>导出完整轨迹 ↓</a></div><h1>${esc(p?.title || s.problemId)}</h1><p class="teacher-muted">${esc(p?.course)} · ${new Date(s.startedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })} · ${s.endedAt ? '已提交' : '未提交'} · 来源待核实</p><div class="teacher-detail-tabs"><button data-detail="timeline" class="active">完整轨迹 (${trace.length})</button><button data-detail="plan">规划版本 (${s.versions.length})</button><button data-detail="chat">AI 对话 (${s.chats.length})</button><button data-detail="code">代码与运行</button></div><div id="record-detail"></div>`;
-  $('#records-back').onclick = () => renderTeacher('records').catch(e => toast(e.message));
-  const draw = tab => {
-    $$('[data-detail]').forEach(b => b.classList.toggle('active', b.dataset.detail === tab));
-    let html;
-    if (tab === 'timeline') html = trace.map(e => `<details class="trace-event"><summary><time>${new Date(e.timestamp).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}</time><strong>${esc(names[e.type] || e.type)}</strong></summary><pre>${esc(['chat_user', 'chat_ai', 'chat_blocked', 'chat_failed'].includes(e.type) ? e.payload.text : JSON.stringify(e.payload, null, 2))}</pre></details>`).join('');
-    else if (tab === 'plan') html = s.versions.map(v => `<section class="trace-event"><h3>规划 v${v.version}</h3><pre>${esc(v.text)}</pre></section>`).join('');
-    else if (tab === 'chat') html = s.chats.map(c => `<section class="message ${c.role === 'user' ? 'user' : ''}"><div class="who">${c.role === 'user' ? '学生' : c.blocked ? '平台提示' : 'AI · ' + esc(c.modelName || c.model || 'DeepSeek（历史记录）')}</div><div class="bubble">${esc(c.text)}</div></section>`).join('');
-    else html = `<h3>当前保存的代码</h3><pre>${esc(s.code)}</pre><h3>最近一次运行</h3><pre>${s.lastRun ? esc(JSON.stringify(s.lastRun, null, 2)) : '暂无运行记录'}</pre>`;
-    $('#record-detail').innerHTML = html || '<div class="teacher-empty">暂无记录</div>';
-  };
-  $$('[data-detail]').forEach(b => b.onclick = () => draw(b.dataset.detail)); draw('timeline');
+function switchFile(f){
+  if(!Object.hasOwn(state.files,f))return;
+  if(f!==activeFile){flushEdit();recordEvent('file_opened',{file:f});}
+  if(editor && activeFile)views.set(activeFile,editor.saveViewState());
+  activeFile=f;if(!openFiles.includes(f))openFiles.push(f);
+  if(editor){
+    modelListener?.dispose();
+    if(!models.has(f))models.set(f,window.monaco.editor.createModel(state.files[f],language(f),window.monaco.Uri.parse(`file:///${project.id}/${f}`)));
+    editor.setModel(models.get(f));if(views.has(f))editor.restoreViewState(views.get(f));
+    modelListener=editor.onDidChangeModelContent(e=>updateFile(editor.getValue(),e));
+  } else if($('#fallback-editor'))$('#fallback-editor').value=state.files[f];
+  $$('.file-row').forEach(b=>b.classList.toggle('active',b.dataset.file===f));renderTabs();persist();
 }
+function updateFile(value,event){
+  if(aiApplying)return;
+  const before=state.files[activeFile]; if(before===value)return;
+  const time=new Date().toISOString();
+  let edit=state.trace.pendingEdit;
+  if(edit && edit.file!==activeFile){flushEdit();edit=null;}
+  edit ||= state.trace.pendingEdit={file:activeFile,before,after:before,startedAt:time,endedAt:time,changes:[]};
+  edit.changes.push({timestamp:time,...textChange(before,value),isUndo:!!event?.isUndoing,isRedo:!!event?.isRedoing});
+  edit.after=value;edit.endedAt=time;state.files[activeFile]=value;
+  $('#save-state').textContent='正在保存…';clearTimeout(saveTimer);saveTimer=setTimeout(persist,350);
+  clearTimeout(editTimer);editTimer=setTimeout(flushEdit,1500);
+  if(Date.parse(time)-Date.parse(edit.startedAt)>=10000)flushEdit();
+}
+function initTrace(){
+  state.trace ||= createTrace(project,state,currentSession().user.id);
+  state.trace.syncing=false;
+  if(state.trace.pendingEdit)flushEdit();
+}
+function flushEdit(){
+  clearTimeout(editTimer);
+  const edit=state?.trace?.pendingEdit;if(!edit)return;
+  delete state.trace.pendingEdit;
+  const event=addEvent(state.trace,'code_edited',edit);event.timestamp=edit.endedAt;
+  persist();scheduleSync();
+}
+function recordEvent(type,payload={},actor='student',flush=true){
+  if(!state?.trace)return;
+  if(flush)flushEdit();const event=addEvent(state.trace,type,payload,actor);persist();scheduleSync();return event;
+}
+function scheduleSync(){
+  const current=state,p=project;if(!current?.trace)return;
+  pendingSync.set(current.trace.id,{current,p});
+  clearTimeout(syncTimer);
+  syncTimer=setTimeout(()=>syncCurrent(current,p),100);
+}
+function syncCurrent(current=state,p=project){
+  if(!current?.trace||current.trace.studentId!==currentSession()?.user.id)return Promise.resolve();
+  const key=storageKey(p.id,current.trace.studentId,current.trace.id);
+  return syncTrace(current.trace,()=>{
+    try{
+      if(current===state)localStorage.setItem(key,JSON.stringify(current));
+      else{
+        const latest=JSON.parse(localStorage.getItem(key));
+        if(latest?.trace?.id===current.trace.id){latest.trace.acknowledged=[...new Set([...latest.trace.acknowledged,...current.trace.acknowledged])];localStorage.setItem(key,JSON.stringify(latest));}
+      }
+    }catch{toast('本地存储已满，请导出轨迹。');}
+  },message=>{if(current===state && $('#trace-status'))$('#trace-status').textContent=message;},{csrf:currentSession().csrf,onAuthError:()=>refreshSession()});
+}
+function saveProject(){flushEdit();recordEvent('code_saved',{file:activeFile,fileCount:Object.keys(state.files).length});persist();toast('项目已保存，轨迹同步中');}
 
-let managingRecords = false;
-async function deleteRecords(ids) {
-  if (managingRecords || !ids.length) return;
-  managingRecords = true;
-  try {
-    const selected = teacherRecords.filter(r => ids.includes(r.id));
-    const summary = selected.slice(0, 5).map(r => `<li>${esc(r.problem)} · ${esc(r.startedAt)} · ${r.id.slice(0, 8)}</li>`).join('');
-    if (!await confirmDialog(`删除 ${ids.length} 条作答记录？`, `<p>将整条记录的规划、对话、代码和运行轨迹移入回收站，并从统计中移除。可在教师端回收站恢复。</p><ul>${summary}</ul>${ids.length > 5 ? `<p>另有 ${ids.length - 5} 条所选记录。</p>` : ''}`, '移入回收站')) return;
-    const filters = ['#record-course', '#record-category', '#record-search'].map(id => $(id)?.value || '');
-    await api('teacher/trash', { ids });
-    await renderTeacher('records');
-    ['#record-course', '#record-category', '#record-search'].forEach((id, i) => { if ([...($(id).options || [])].some(o => o.value === filters[i]) || id === '#record-search') $(id).value = filters[i]; });
-    renderRecordRows(); toast(`已将 ${ids.length} 条记录移入回收站`);
-  } catch (e) { toast(e.message); }
-  finally { managingRecords = false; }
+function applyPanels(){
+  $('#assessment').classList.toggle('chat-collapsed',!!state.chatCollapsed);
+  $('.ide').classList.toggle('tree-collapsed',!!state.treeCollapsed);
+  $('.editor-column').classList.toggle('terminal-collapsed',!!state.terminalCollapsed);
+  $('#toggle-chat').setAttribute('aria-expanded',String(!state.chatCollapsed));
 }
-async function renderTrash() {
-  const rows = await api('teacher/trash');
-  if (teacherTab !== 'records' || !$('#inline-trash') || $('#inline-trash').classList.contains('hidden') || $('#teacher-page').classList.contains('hidden')) return;
-  $('#inline-trash').innerHTML = `<span class="eyebrow">RECYCLE BIN</span><div class="teacher-title"><h2>回收站</h2><div class="record-actions"><button id="back-from-trash" class="quiet-action">收起</button><button id="refresh-trash">刷新 ↻</button></div></div><p class="teacher-muted">共 ${rows.length} 条记录。删除后不计入作答统计，恢复后保留原记录编号和完整轨迹。</p><div class="teacher-table-wrap"><table class="teacher-table"><thead><tr><th>题目 / 课程</th><th>删除时间</th><th>操作</th></tr></thead><tbody>${rows.map(r => `<tr><td><strong>${esc(r.problem)}</strong><small>${esc(r.course)} · ${r.id.slice(0, 8)}</small></td><td>${new Date(r.deletedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}</td><td><button data-restore-record="${r.id}" class="small">恢复记录</button></td></tr>`).join('')}</tbody></table>${rows.length ? '' : '<div class="teacher-empty">回收站为空</div>'}</div>`;
-  $('#back-from-trash').onclick = () => $('#open-trash').click();
-  $('#refresh-trash').onclick = () => renderTrash().catch(e => toast(e.message));
-  $$('[data-restore-record]').forEach(b => b.onclick = async () => {
-    if (managingRecords) return;
-    managingRecords = true; b.disabled = true;
-    try { await api('teacher/restore', { ids: [b.dataset.restoreRecord] }); await renderTrash();
-      teacherRecords = await api('teacher/records');
-      if ($('#record-total')) { $('#record-total').textContent = teacherRecords.length; $('#record-chat-total').textContent = teacherRecords.filter(r => r.messages > 0).length; renderRecordRows(); }
-      toast('记录已恢复'); }
-    catch (e) { toast(e.message); b.disabled = false; }
-    finally { managingRecords = false; }
+function togglePanel(key){state[key]=!state[key];applyPanels();persist();}
+function renderMessages(showWelcome=false){
+  $('#messages').innerHTML=`<div class="chat-welcome"><span class="welcome-icon">${icon('spark')}</span><h3>${esc(welcomeTitle)}</h3><p>${esc(welcomeBody)}</p><div class="welcome-rule"><span></span>先说思路，再动手实现<span></span></div><button class="suggestion" data-suggestion="这是我的实现规划：">${icon('book')} 描述我的规划 ${icon('arrow')}</button><button class="suggestion" data-suggestion="请解释一下这段代码的行为">${icon('layers')} 解释已有代码 ${icon('arrow')}</button><button class="suggestion" data-suggestion="请帮我解释这个报错：">${icon('check')} 解释报错信息 ${icon('arrow')}</button></div>`+state.messages.map(m=>`<div class="message ${m.role}"><div class="message-author">${m.role==='user'?'你':icon('spark')+(m.source==='ai'?' AI 助手':' AI Tutor · 历史演示')}</div><div class="bubble">${esc(m.text)}</div></div>`).join('');
+  $$('[data-suggestion]').forEach(b=>b.onclick=()=>{$('#chat-input').value=b.dataset.suggestion;$('#chat-input').focus();});
+  $('#messages').scrollTop=showWelcome?0:$('#messages').scrollHeight;
+}
+async function ensureSynced(current=state){
+  flushEdit();persist();await syncCurrent(current,project);
+  if(current.trace.events.some(e=>!current.trace.acknowledged.includes(e.id)))throw Error('轨迹还未同步成功，请等待网络恢复后重试，文件没有丢失。');
+}
+async function sendMessage(){
+  const input=$('#chat-input'),value=input.value.trim();if(!value||['running','approval'].includes(agentInfo?.status))return;
+  if(!agentInfo?.configured){toast('请教师先在 AI 连接中配置密钥。');return;}
+  if(value.length>12000){toast('消息过长，请分步说明。');return;}
+  const current=state,id=current.trace.id;
+  const event=recordEvent('chat_user',{text:value,file:activeFile});
+  state.messages.push({role:'user',text:value,eventId:event.id});input.value='';renderMessages();persist();
+  try{
+    await ensureSynced(current);
+    if(current!==state)return;
+    agentInfo={...agentInfo,status:'running'};drawAgent();
+    await agentRequest(`/api/agent/${id}/message`,{messageId:event.id});
+    await pollAgent(current);
+  }catch(e){if(current===state){toast(e.message);await pollAgent(current);}}
+}
+function renderLiveReply(){
+  const host=$('#messages');if(!host)return;
+  let node=$('#live-ai-reply');
+  if(!liveReply||state?.messages.some(m=>m.eventId===liveReply.id)){node?.remove();return;}
+  const pinned=host.scrollHeight-host.scrollTop-host.clientHeight<80;
+  if(!node){node=document.createElement('div');node.id='live-ai-reply';node.className='message assistant';node.innerHTML='<div class="message-author">AI 助手 · 正在生成</div><div class="bubble"></div><small class="live-phase"></small>';host.append(node);}
+  node.querySelector('.bubble').textContent=liveReply.text;
+  node.querySelector('.live-phase').textContent=liveReply.phase==='tool'?'正在准备工具操作；文件改动仍需确认':'回复尚未完成…';
+  if(pinned)host.scrollTop=host.scrollHeight;
+}
+function connectAgentStream(current){
+  agentStream?.close();
+  const path=`/api/agent/${current.trace.id}/live`;
+  agentStream=connectAgentLive({url:`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}${path}`,
+    isRunning:()=>agentInfo?.status==='running',
+    fetchSnapshot:async signal=>{const r=await fetch(path,{cache:'no-store',signal});if(!r.ok)throw Error('实时连接暂不可用');return r.json();},
+    onValue:value=>{
+      if(current!==state)return;
+      liveReply=value;
+      if(liveReply)renderLiveReply();else pollAgent(current).finally(()=>{if(current===state)renderLiveReply();});
+    },
+    onStatus:status=>{if(current===state&&status==='reconnecting'&&$('#live-ai-reply .live-phase'))$('#live-ai-reply .live-phase').textContent='实时连接恢复中，正在补取已生成文字…';}
   });
 }
+
+function drawAgent(){
+  if(!agentInfo||!state)return;
+  renderAgentStatus(agentInfo,{prompt:()=>showPromptTrial(project.id,()=>pollAgent(state)),review:proposal=>reviewChanges(proposal,decideAgent),resume:async()=>{
+    try{await ensureSynced();await agentRequest(`/api/agent/${state.trace.id}/resume`,{});pollAgent(state);}catch(e){toast(e.message);}
+  }});
+}
+async function decideAgent(proposalId,approved){
+  const current=state;
+  await ensureSynced(current);
+  if(current!==state)throw Error('项目已切换，请重新打开改动确认。');
+  if(approved){editor?.updateOptions({readOnly:true});if($('#fallback-editor'))$('#fallback-editor').disabled=true;if($('#new-file'))$('#new-file').disabled=true;}
+  try{await agentRequest(`/api/agent/${current.trace.id}/decision`,{proposalId,approved});await pollAgent(current);}
+  catch(e){editor?.updateOptions({readOnly:false});if($('#fallback-editor'))$('#fallback-editor').disabled=false;if($('#new-file'))$('#new-file').disabled=false;throw e;}
+}
+async function pollAgent(current){
+  clearTimeout(agentTimer);
+  if(!current?.trace||current!==state)return;
+  try{
+    const info=await agentRequest(`/api/agent/${current.trace.id}`);
+    if(current!==state)return;
+    agentInfo=info;let changed=false,filesChanged=false;
+    const known=new Set(current.trace.events.map(e=>e.id));
+    for(const event of info.events){
+      if(known.has(event.id))continue;
+      if(event.type==='ai_changes_applied'){
+        const conflict=event.payload.changes.some(c=>{const local=Object.hasOwn(current.files,c.path)?current.files[c.path]:null;return local!==c.before&&local!==c.after;});
+        if(conflict){toast('收到其他页面的 AI 改动，本地内容已保留，请先导出项目并核对版本。');continue;}
+        for(const change of event.payload.changes)current.files[change.path]=change.after;
+        filesChanged=true;
+      }
+      if(['ai_response','ai_response_partial'].includes(event.type)&&!current.messages.some(m=>m.eventId===event.id)){current.messages.push({role:'assistant',text:event.payload.text,source:'ai',eventId:event.id});changed=true;}
+      current.trace.events.push(event);current.trace.acknowledged.push(event.id);known.add(event.id);
+    }
+    if(filesChanged){
+      aiApplying=true;modelListener?.dispose();
+      try{for(const [file,model] of models)if(Object.hasOwn(current.files,file)&&model.getValue()!==current.files[file])model.setValue(current.files[file]);renderTree();renderTabs();switchFile(activeFile);}
+      finally{aiApplying=false;}
+    }
+    if(info.status!=='running'){editor?.updateOptions({readOnly:false});if($('#fallback-editor'))$('#fallback-editor').disabled=false;if($('#new-file'))$('#new-file').disabled=false;}
+    if(changed)renderMessages();renderLiveReply();persist();drawAgent();
+  }catch(error){if(current===state&&$('#agent-controls'))$('#agent-controls').textContent='AI 状态暂不可用 · 将自动重连';}
+  finally{if(current===state)agentTimer=setTimeout(()=>pollAgent(current),['running','approval'].includes(agentInfo?.status)?1400:8000);}
+}
+function appendConsole(text,cls=''){const div=document.createElement('div');div.textContent=text;div.className=cls;$('#console-output').append(div);$('#console-output').scrollTop=$('#console-output').scrollHeight;}
+function bindWorkspace(){
+  $$('[data-problem-tab]').forEach(b=>b.onclick=async()=>{
+    $$('[data-problem-tab]').forEach(x=>{x.classList.toggle('active',x===b);x.setAttribute('aria-selected',String(x===b));});
+    const token=++pendingSource, id=project.id;$('#problem-content').innerHTML=problemBody(b.dataset.problemTab);
+    if(b.dataset.problemTab==='source')try{const res=await fetch(`/api/problems/${id}`);if(!res.ok)throw Error();const {content}=await res.json();if(token===pendingSource&&project?.id===id&&$('#source-text'))$('#source-text').textContent=content;}catch{if($('#source-text'))$('#source-text').textContent='原始题面加载失败，请重新选择此标签页。';}
+  });
+  $('#toggle-chat').onclick=$('#collapse-chat').onclick=$('#chat-rail').onclick=()=>togglePanel('chatCollapsed');
+  $('#hide-tree').onclick=$('#show-tree').onclick=()=>togglePanel('treeCollapsed');
+  $('#hide-terminal').onclick=$('#toggle-terminal').onclick=()=>togglePanel('terminalCollapsed');
+  $('#save-project').onclick=()=>saveProject();
+  $('#new-file').onclick=()=>{$('#file-error').textContent='';$('#file-path').value='';$('#file-dialog').showModal();$('#file-path').focus();};
+  $('#export-project').onclick=()=>{
+    recordEvent('project_exported',{fileCount:Object.keys(state.files).length});persist();const blob=new Blob([JSON.stringify({project:project.id,title:project.name,exportedAt:new Date().toISOString(),files:state.files,messages:state.messages,trace:state.trace},null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`${esc(project.folder)}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),2000);toast('已导出项目文件与对话记录');
+  };
+  $('#chat-form').onsubmit=e=>{e.preventDefault();sendMessage();};
+  $('#chat-input').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendMessage();}};
+
+}
+function validPath(value){return typeof value==='string' && value.length<=160 && value!=='datasets' && !value.startsWith('datasets/') && !value.startsWith('/') && !value.includes('\\') && !/[\x00-\x1f<>:"|?*]/.test(value) && value.split('/').every(p=>p&&p!=='.'&&p!=='..'&&!['__proto__','constructor','prototype'].includes(p));}
+$('#file-form').onsubmit=e=>{
+  e.preventDefault();if(!state)return;const name=$('#file-path').value.trim();
+  if(!validPath(name)){ $('#file-error').textContent='请输入有效的相对文件路径，不可包含 .. 或特殊字符。';return; }
+  if(name==='artifacts'||name.startsWith('artifacts/')){ $('#file-error').textContent='artifacts 目录用于保存运行产物，请在其他目录创建源码。';return; }
+  if(Object.hasOwn(state.files,name)){ $('#file-error').textContent='这个文件已存在，请换一个名称。';return; }
+  flushEdit();state.files[name]='';recordEvent('file_created',{file:name,content:''});renderTree();switchFile(name);$('#file-dialog').close();toast(`已创建 ${name}`);
+};
+$('#file-cancel').onclick=()=>$('#file-dialog').close();
+function updateTimer(){if(!state||!$('#timer'))return;const t=Math.floor(state.elapsed);$('#timer').textContent=[Math.floor(t/3600),Math.floor(t/60)%60,t%60].map(v=>String(v).padStart(2,'0')).join(':');}
+setInterval(()=>{if(state&&!document.hidden){state.elapsed+=1;updateTimer();if(state.elapsed%10===0)persist();}},1000);
+window.addEventListener('beforeunload',()=>{flushEdit();clearTimeout(saveTimer);persist();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden){flushEdit();persist();}});
+function retryPending(){for(const {current,p} of pendingSync.values())syncCurrent(current,p);}
+window.addEventListener('online',retryPending);
+setInterval(retryPending,5000);
+document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='s'&&state){e.preventDefault();saveProject();}});
+let refreshing=false;
+function announceAccountChange(){try{localStorage.setItem('yuzhi-auth-change',crypto.randomUUID());}catch{}}
+async function refreshSession(){
+  if(refreshing)return;
+  refreshing=true;
+  try {
+    const next=await authRequest('me');
+    if(next.user?.id!==currentSession()?.user.id||next.csrf!==currentSession()?.csrf){
+      cleanup();project=null;state=null;currentKey=null;clearTimeout(syncTimer);pendingSync.clear();
+      setSession(next);route();
+    }
+  }catch{toast('暂时无法连接服务器，本地修改已保留。');}
+  finally{refreshing=false;}
+}
+async function logout(){
+  const button=$('#account-logout');if(button)button.disabled=true;
+  cleanup();project=null;state=null;currentKey=null;
+  await Promise.all([...pendingSync.values()].map(({current,p})=>syncCurrent(current,p)));
+  try{
+    await authRequest('logout',{});clearTimeout(syncTimer);pendingSync.clear();setSession(null);
+    announceAccountChange();location.hash='#/login';route();
+  }catch(e){toast(e.message);if(button)button.disabled=false;route();}
+}
+let routeVersion=0;
+async function route(){
+  const routeTicket=++routeVersion;
+  currentKey=null;
+  renderAccountHeader(logout);
+  if(!currentSession()){
+    cleanup();project=null;state=null;
+    renderAuth(result=>{announceAccountChange();location.hash=result.user.role==='teacher'?'#/teacher':'#/student';route();});
+    return;
+  }
+  try{const response=await fetch('/api/projects',{cache:'no-store'});const loaded=response.status===404?(await import('./projects.js')).projects:response.ok?await response.json():null;if(!loaded)throw Error('项目列表加载失败');if(routeTicket!==routeVersion)return;projects=loaded;}
+  catch(e){cleanup();$('#app').innerHTML='<div class="teacher-empty">项目列表暂时无法加载，请刷新重试。</div>';return;}
+  const teacher=location.hash.split('?')[0].match(/^#\/teacher(?:\/([a-zA-Z0-9_-]{8,80}))?$/);
+  if(teacher && currentSession().user.role!=='teacher'){location.hash='#/student';return;}
+  if(teacher){
+    flushEdit();cleanup();project=null;state=null;
+    const target=location.hash;
+    const waiting=[];
+    for(const p of projects){
+      const current=readState(p);if(!current.trace)continue;
+      if(current.trace.pendingEdit){const edit=current.trace.pendingEdit;delete current.trace.pendingEdit;const e=addEvent(current.trace,'code_edited',edit);e.timestamp=edit.endedAt;try{localStorage.setItem(storageKey(p.id),JSON.stringify(current));}catch{toast('本地记录保存失败，请返回学生端导出。');}}
+      const pending=pendingSync.get(current.trace.id);
+      if(pending)waiting.push(syncCurrent(pending.current,pending.p));
+      else{pendingSync.set(current.trace.id,{current,p});waiting.push(syncCurrent(current,p));}
+    }
+    $('#app').innerHTML='<div class="teacher-empty">正在同步作答记录…</div>';
+    Promise.all(waiting).finally(()=>{if(location.hash===target)renderTeacher(projects,teacher[1]);});return;
+  }
+  const id=location.hash.split('?')[0].match(/^#\/project\/(project[1-9][0-9]{0,5})$/)?.[1],p=projects.find(p=>p.id===id);
+  const attemptId=new URLSearchParams(location.hash.split('?')[1]||'').get('attempt');
+  if(p){if(attemptId)renderWorkspace(p,attemptId);else renderAttemptPicker(p);}else if(location.hash==='#/student')renderHome();else {location.hash=currentSession().user.role==='teacher'?'#/teacher':'#/student';}
+}
+let booted=false;
+window.addEventListener('hashchange',()=>{if(booted)route();});
+window.addEventListener('storage',event=>{if(event.key==='yuzhi-auth-change')refreshSession();});
+window.addEventListener('focus',()=>{if(booted)refreshSession();});
+async function boot(){
+  $('#app').innerHTML='<div class="teacher-empty">正在连接学习空间…</div>';
+  try{setSession(await authRequest('me'));booted=true;route();}
+  catch{$('#app').innerHTML='<div class="teacher-empty"><h2>暂时无法连接服务器</h2><p>请检查网络连接后重试。</p><button id="retry-connection">重新连接</button></div>';$('#retry-connection').onclick=boot;}
+}
+boot();

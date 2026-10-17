@@ -1,0 +1,14 @@
+# Install as ~/.config/systemd/user/yuzhi.service after adjusting WorkingDirectory.
+[Unit]
+Description=Yuzhi assessment workspace
+
+[Service]
+Type=simple
+WorkingDirectory=%h/yuzhi-ai
+ExecStart=/usr/bin/node --env-file-if-exists=.env server.mjs
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=default.target

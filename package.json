@@ -1,15 +1,24 @@
 {
-  "name": "yuzhi-mvp",
+  "name": "yuzhi-assessment-ui",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.mjs",
-    "test": "node --test tests/*.test.mjs"
+    "check": "node --check server.mjs && node --check src/trace-store.mjs && node --check public/app.js && node --check public/projects.js && node --check public/workspace-state.js && node --check public/trace.js && node --check public/teacher.js && node --check src/auth-store.mjs && node --check public/auth.js && node --check scripts/setup-teacher.mjs && node --check public/teacher-groups.js && node --check src/agent-policy.mjs && node --check src/agent-model.mjs && node --check src/agent-runtime.mjs && node --check public/agent-client.js && node --check src/execution-service.mjs && node --check src/execution-sandbox.mjs && node --check public/execution.js && node --check src/agent-context.mjs && node --check src/process-assessment.mjs && node --check src/assessment-service.mjs && node --check public/assessment.js && node --check scripts/assess-trace.mjs && node --check src/model-stream.mjs && node --check src/agent-stream.mjs && node --check public/code-diff.js && node --check src/student-memory.mjs && node --check public/memory.js && node --check src/project-catalog.mjs && node --check src/prompt-trials.mjs && node --check public/prompt-workbench.js && node --check src/agent-websocket.mjs && node --check public/agent-live.js",
+    "test": "node --test tests/*.test.mjs",
+    "setup:teacher": "node --env-file-if-exists=.env scripts/setup-teacher.mjs",
+    "runner:check": "node scripts/check-runner.mjs",
+    "test:execution": "YUZHI_TEST_EXECUTION=1 node --test tests/execution.test.mjs",
+    "assess:trace": "node --env-file-if-exists=.env scripts/assess-trace.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.84.4",
-    "@earendil-works/pi-ai": "0.84.4",
-    "monaco-editor": "^0.55.1"
+    "@langchain/langgraph": "1.5.0",
+    "@langchain/langgraph-checkpoint-sqlite": "1.1.0",
+    "monaco-editor": "0.55.1",
+    "ws": "^8.22.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
   }
 }
